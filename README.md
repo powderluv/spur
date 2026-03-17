@@ -1,6 +1,6 @@
 # Spur
 
-A clean-room HPC job scheduler written in Rust. Drop-in compatible with Slurm's CLI, REST API, and C FFI while providing native Kubernetes support and modern state management.
+An AI-native job scheduler written in Rust. Drop-in compatible with Slurm's CLI, REST API, and C FFI while providing WireGuard mesh networking, GPU-first scheduling, and modern state management.
 
 ## Quick Start
 

@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("spur — HPC job scheduler");
+    eprintln!("spur — AI-native job scheduler");
     eprintln!();
     eprintln!("Usage: spur <command> [args...]");
     eprintln!();

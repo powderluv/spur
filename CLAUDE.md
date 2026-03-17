@@ -1,6 +1,6 @@
 # Spur
 
-Spur is a clean-room HPC job scheduler written in Rust. It is drop-in compatible with Slurm's CLI, REST API, and C FFI while providing WireGuard mesh networking and modern state management.
+Spur is an AI-native job scheduler written in Rust. It is drop-in compatible with Slurm's CLI, REST API, and C FFI while providing WireGuard mesh networking, GPU-first scheduling, and modern state management.
 
 ## Build
 
