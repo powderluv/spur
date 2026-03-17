@@ -159,16 +159,44 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RegisterAgentRequest>,
     ) -> Result<Response<RegisterAgentResponse>, Status> {
+        // Extract the remote IP from the gRPC connection
+        let remote_addr = request.remote_addr()
+            .map(|a| {
+                let ip = a.ip();
+                // Normalize IPv4-mapped IPv6 addresses
+                match ip {
+                    std::net::IpAddr::V6(v6) => {
+                        if let Some(v4) = v6.to_ipv4_mapped() {
+                            v4.to_string()
+                        } else {
+                            ip.to_string()
+                        }
+                    }
+                    _ => ip.to_string(),
+                }
+            })
+            .unwrap_or_default();
+
         let req = request.into_inner();
         let resources = req
             .resources
             .map(proto_to_resource_set)
             .unwrap_or_default();
 
+        // Use remote IP as agent address (for job dispatch), fall back to hostname
+        let is_loopback = remote_addr.is_empty()
+            || remote_addr == "127.0.0.1"
+            || remote_addr == "::1";
+        let agent_addr = if is_loopback {
+            "127.0.0.1".to_string()
+        } else {
+            remote_addr
+        };
+
         self.cluster.register_node(
             req.hostname.clone(),
             resources,
-            req.hostname.clone(), // Address defaults to hostname
+            agent_addr,
             req.version,
         );
 

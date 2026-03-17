@@ -1,3 +1,4 @@
+mod agent_server;
 mod executor;
 mod gpu;
 mod reporter;
@@ -19,6 +20,10 @@ struct Args {
     /// Controller address
     #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
     controller: String,
+
+    /// Agent gRPC listen address
+    #[arg(long, default_value = "[::]:6818")]
+    listen: String,
 
     /// Node name (defaults to hostname)
     #[arg(short = 'N', long)]
@@ -54,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         hostname = %hostname,
         controller = %args.controller,
+        listen = %args.listen,
         "spurd starting"
     );
 
@@ -66,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         "resources discovered"
     );
 
-    // Create the node reporter (handles registration + heartbeat)
+    // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
         args.controller.clone(),
@@ -78,22 +84,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Start heartbeat loop
     let hb_reporter = reporter.clone();
-    let hb_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         hb_reporter.heartbeat_loop().await;
     });
 
-    // Start job execution listener (polls controller for assigned jobs)
-    let exec_reporter = reporter.clone();
-    let exec_handle = tokio::spawn(async move {
-        executor::job_execution_loop(exec_reporter).await;
-    });
+    // Start agent gRPC server (receives job launches from spurctld)
+    let agent_service = agent_server::AgentService::new(reporter.clone());
+    agent_service.start_monitor(args.controller.clone());
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    info!("spurd shutting down");
+    let addr = args.listen.parse()?;
+    info!(%addr, "agent gRPC server listening");
 
-    hb_handle.abort();
-    exec_handle.abort();
+    tonic::transport::Server::builder()
+        .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent_service))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }

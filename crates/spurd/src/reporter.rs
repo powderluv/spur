@@ -200,7 +200,7 @@ fn read_free_memory_mb() -> u64 {
     0
 }
 
-fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
+pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
     ProtoResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,

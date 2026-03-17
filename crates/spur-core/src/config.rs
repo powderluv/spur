@@ -50,18 +50,30 @@ pub struct SlurmConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerConfig {
     /// gRPC listen address for the controller.
+    #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     /// REST API listen address.
+    #[serde(default = "default_rest_addr")]
     pub rest_addr: String,
     /// Hostname(s) for HA. First is primary.
+    #[serde(default = "default_hosts")]
     pub hosts: Vec<String>,
     /// State save location.
+    #[serde(default = "default_state_dir")]
     pub state_dir: String,
     /// Max job ID before wrapping.
+    #[serde(default = "default_max_job_id")]
     pub max_job_id: u32,
     /// First job ID.
+    #[serde(default = "default_one")]
     pub first_job_id: u32,
 }
+
+fn default_listen_addr() -> String { "[::]:6817".into() }
+fn default_rest_addr() -> String { "[::]:6820".into() }
+fn default_hosts() -> Vec<String> { vec!["localhost".into()] }
+fn default_state_dir() -> String { "/var/spool/spur".into() }
+fn default_max_job_id() -> u32 { 999_999_999 }
 
 impl Default for ControllerConfig {
     fn default() -> Self {

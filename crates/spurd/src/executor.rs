@@ -58,10 +58,17 @@ async fn report_completion(controller_addr: &str, job_id: JobId, exit_code: i32)
 }
 
 /// A running job process.
-struct RunningJob {
+pub struct RunningJob {
     job_id: JobId,
     child: tokio::process::Child,
     cgroup_path: Option<PathBuf>,
+}
+
+impl RunningJob {
+    /// Consume self and return the child process (for tracking by agent server).
+    pub fn into_child(self) -> tokio::process::Child {
+        self.child
+    }
 }
 
 impl RunningJob {
