@@ -35,6 +35,7 @@ pub mod t05_queue;
 pub mod t06_cancel;
 pub mod t07_sched;
 pub mod t17_submit;
+pub mod t21_acctmgr;
 pub mod t24_priority;
 pub mod t28_arrays;
 pub mod t39_gpu;

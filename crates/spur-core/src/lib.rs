@@ -1,10 +1,12 @@
 pub mod array;
 pub mod auth;
+pub mod accounting;
 pub mod config;
 pub mod dependency;
 pub mod hostlist;
 pub mod job;
 pub mod node;
 pub mod partition;
+pub mod qos;
 pub mod resource;
 pub mod wal;

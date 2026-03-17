@@ -76,12 +76,53 @@ CREATE TABLE IF NOT EXISTS usage (
     PRIMARY KEY (user_name, account, period_start)
 );
 
+CREATE TABLE IF NOT EXISTS qos (
+    name            TEXT PRIMARY KEY,
+    description     TEXT NOT NULL DEFAULT '',
+    priority        INTEGER NOT NULL DEFAULT 0,
+    preempt_mode    TEXT NOT NULL DEFAULT 'off',
+    usage_factor    REAL NOT NULL DEFAULT 1.0,
+    max_jobs_per_user INTEGER,
+    max_submit_per_user INTEGER,
+    max_tres_per_job TEXT,
+    max_tres_per_user TEXT,
+    grp_tres        TEXT,
+    max_wall_min    INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS associations (
+    id              SERIAL PRIMARY KEY,
+    user_name       TEXT NOT NULL,
+    account         TEXT NOT NULL REFERENCES accounts(name),
+    partition_name  TEXT,
+    fairshare_weight INTEGER NOT NULL DEFAULT 1,
+    is_default      BOOLEAN NOT NULL DEFAULT false,
+    max_running_jobs INTEGER,
+    max_submit_jobs INTEGER,
+    max_tres_per_job TEXT,
+    grp_tres        TEXT,
+    max_wall_min    INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_name, account, partition_name)
+);
+
+CREATE TABLE IF NOT EXISTS tres_usage (
+    job_id          INTEGER NOT NULL,
+    tres_type       TEXT NOT NULL,
+    alloc_value     BIGINT NOT NULL DEFAULT 0,
+    used_value      BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (job_id, tres_type)
+);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_name);
 CREATE INDEX IF NOT EXISTS idx_jobs_account ON jobs(account);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_submit_time ON jobs(submit_time);
 CREATE INDEX IF NOT EXISTS idx_jobs_start_time ON jobs(start_time);
 CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_start, period_end);
+CREATE INDEX IF NOT EXISTS idx_assoc_user ON associations(user_name);
+CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
 "#;
 
 /// Record a job start in the database.
@@ -358,3 +399,198 @@ pub struct UsageRecord {
 }
 
 use chrono::Timelike;
+
+// ============================================================
+// Account / User / QOS management (sacctmgr operations)
+// ============================================================
+
+/// Create or update an account.
+pub async fn upsert_account(
+    pool: &PgPool,
+    name: &str,
+    description: &str,
+    organization: &str,
+    parent: Option<&str>,
+    fairshare: i32,
+    max_running_jobs: Option<i32>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO accounts (name, description, organization, parent_account, fairshare_weight, max_running_jobs)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (name) DO UPDATE SET
+            description = $2, organization = $3, parent_account = $4,
+            fairshare_weight = $5, max_running_jobs = $6
+        "#,
+    )
+    .bind(name).bind(description).bind(organization)
+    .bind(parent).bind(fairshare).bind(max_running_jobs)
+    .execute(pool).await?;
+    Ok(())
+}
+
+/// Delete an account.
+pub async fn delete_account(pool: &PgPool, name: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM accounts WHERE name = $1")
+        .bind(name).execute(pool).await?;
+    Ok(())
+}
+
+/// List all accounts.
+pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
+    let rows = sqlx::query(
+        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs FROM accounts ORDER BY name"
+    ).fetch_all(pool).await?;
+
+    Ok(rows.iter().map(|r| AccountRecord {
+        name: r.get("name"),
+        description: r.get("description"),
+        organization: r.get("organization"),
+        parent: r.get("parent_account"),
+        fairshare_weight: r.get("fairshare_weight"),
+        max_running_jobs: r.get("max_running_jobs"),
+    }).collect())
+}
+
+#[derive(Debug)]
+pub struct AccountRecord {
+    pub name: String,
+    pub description: String,
+    pub organization: String,
+    pub parent: Option<String>,
+    pub fairshare_weight: i32,
+    pub max_running_jobs: Option<i32>,
+}
+
+/// Add a user-account association.
+pub async fn add_user(
+    pool: &PgPool,
+    user: &str,
+    account: &str,
+    admin_level: &str,
+    is_default: bool,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO users (name, account, admin_level, default_account)
+        VALUES ($1, $2, $3, CASE WHEN $4 THEN $2 ELSE NULL END)
+        ON CONFLICT (name, account) DO UPDATE SET admin_level = $3
+        "#,
+    )
+    .bind(user).bind(account).bind(admin_level).bind(is_default)
+    .execute(pool).await?;
+
+    // Also create association
+    sqlx::query(
+        r#"
+        INSERT INTO associations (user_name, account, is_default)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_name, account, partition_name) DO UPDATE SET is_default = $3
+        "#,
+    )
+    .bind(user).bind(account).bind(is_default)
+    .execute(pool).await?;
+
+    Ok(())
+}
+
+/// Remove a user from an account.
+pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM users WHERE name = $1 AND account = $2")
+        .bind(user).bind(account).execute(pool).await?;
+    sqlx::query("DELETE FROM associations WHERE user_name = $1 AND account = $2")
+        .bind(user).bind(account).execute(pool).await?;
+    Ok(())
+}
+
+/// List users, optionally filtered by account.
+pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<Vec<UserRecord>> {
+    let rows = if let Some(acct) = account {
+        sqlx::query("SELECT name, account, admin_level, default_account FROM users WHERE account = $1 ORDER BY name")
+            .bind(acct).fetch_all(pool).await?
+    } else {
+        sqlx::query("SELECT name, account, admin_level, default_account FROM users ORDER BY name, account")
+            .fetch_all(pool).await?
+    };
+
+    Ok(rows.iter().map(|r| UserRecord {
+        name: r.get("name"),
+        account: r.get("account"),
+        admin_level: r.get("admin_level"),
+        default_account: r.get("default_account"),
+    }).collect())
+}
+
+#[derive(Debug)]
+pub struct UserRecord {
+    pub name: String,
+    pub account: String,
+    pub admin_level: String,
+    pub default_account: Option<String>,
+}
+
+/// Create or update a QOS.
+pub async fn upsert_qos(
+    pool: &PgPool,
+    name: &str,
+    description: &str,
+    priority: i32,
+    preempt_mode: &str,
+    usage_factor: f64,
+    max_jobs_per_user: Option<i32>,
+    max_wall_min: Option<i32>,
+    max_tres_per_job: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO qos (name, description, priority, preempt_mode, usage_factor,
+                         max_jobs_per_user, max_wall_min, max_tres_per_job)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (name) DO UPDATE SET
+            description = $2, priority = $3, preempt_mode = $4, usage_factor = $5,
+            max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8
+        "#,
+    )
+    .bind(name).bind(description).bind(priority).bind(preempt_mode)
+    .bind(usage_factor).bind(max_jobs_per_user).bind(max_wall_min)
+    .bind(max_tres_per_job)
+    .execute(pool).await?;
+    Ok(())
+}
+
+/// Delete a QOS.
+pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM qos WHERE name = $1")
+        .bind(name).execute(pool).await?;
+    Ok(())
+}
+
+/// List all QOS.
+pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
+    let rows = sqlx::query(
+        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job FROM qos ORDER BY name"
+    ).fetch_all(pool).await?;
+
+    Ok(rows.iter().map(|r| QosRecord {
+        name: r.get("name"),
+        description: r.get("description"),
+        priority: r.get("priority"),
+        preempt_mode: r.get("preempt_mode"),
+        usage_factor: r.get("usage_factor"),
+        max_jobs_per_user: r.get("max_jobs_per_user"),
+        max_wall_min: r.get("max_wall_min"),
+        max_tres_per_job: r.get("max_tres_per_job"),
+    }).collect())
+}
+
+#[derive(Debug)]
+pub struct QosRecord {
+    pub name: String,
+    pub description: String,
+    pub priority: i32,
+    pub preempt_mode: String,
+    pub usage_factor: f64,
+    pub max_jobs_per_user: Option<i32>,
+    pub max_wall_min: Option<i32>,
+    pub max_tres_per_job: Option<String>,
+}

@@ -1,5 +1,6 @@
 mod format_engine;
 mod sacct;
+mod sacctmgr;
 mod sbatch;
 mod scancel;
 mod scontrol;
@@ -29,6 +30,7 @@ fn main() -> anyhow::Result<()> {
         "scancel" => return runtime.block_on(scancel::main()),
         "sinfo" => return runtime.block_on(sinfo::main()),
         "sacct" => return runtime.block_on(sacct::main()),
+        "sacctmgr" => return runtime.block_on(sacctmgr::main()),
         "scontrol" => return runtime.block_on(scontrol::main()),
         _ => {}
     }
@@ -48,6 +50,7 @@ fn main() -> anyhow::Result<()> {
         "cancel" | "kill" => runtime.block_on(scancel::main()),
         "nodes" | "info" => runtime.block_on(sinfo::main()),
         "history" | "acct" => runtime.block_on(sacct::main()),
+        "accounts" | "acctmgr" => runtime.block_on(sacctmgr::main()),
         "show" | "control" | "ctl" => runtime.block_on(scontrol::main()),
 
         // Slurm-compatible subcommands (for migration)
@@ -57,6 +60,7 @@ fn main() -> anyhow::Result<()> {
         "scancel" => runtime.block_on(scancel::main()),
         "sinfo" => runtime.block_on(sinfo::main()),
         "sacct" => runtime.block_on(sacct::main()),
+        "sacctmgr" => runtime.block_on(sacctmgr::main()),
         "scontrol" => runtime.block_on(scontrol::main()),
 
         "version" | "--version" | "-V" => {
@@ -88,9 +92,10 @@ fn print_usage() {
     eprintln!("  cancel      Cancel pending or running jobs");
     eprintln!("  nodes       View cluster node information");
     eprintln!("  history     View job accounting history");
+    eprintln!("  accounts    Manage accounts, users, and QOS");
     eprintln!("  show        Show detailed job/node/partition info");
     eprintln!("  version     Show version");
     eprintln!();
     eprintln!("Slurm-compatible aliases (also work as symlinks):");
-    eprintln!("  sbatch srun squeue scancel sinfo sacct scontrol");
+    eprintln!("  sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
 }
