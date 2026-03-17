@@ -14,16 +14,23 @@ pub struct NodeReporter {
     pub hostname: String,
     pub controller_addr: String,
     pub resources: ResourceSet,
+    pub node_address: spur_net::NodeAddress,
     pub free_memory_mb: AtomicU64,
     pub cpu_load: AtomicU64,
 }
 
 impl NodeReporter {
-    pub fn new(hostname: String, controller_addr: String, resources: ResourceSet) -> Self {
+    pub fn new(
+        hostname: String,
+        controller_addr: String,
+        resources: ResourceSet,
+        node_address: spur_net::NodeAddress,
+    ) -> Self {
         Self {
             hostname,
             controller_addr,
             resources,
+            node_address,
             free_memory_mb: AtomicU64::new(0),
             cpu_load: AtomicU64::new(0),
         }
@@ -40,6 +47,9 @@ impl NodeReporter {
                 hostname: self.hostname.clone(),
                 resources: Some(resource_to_proto(&self.resources)),
                 version: env!("CARGO_PKG_VERSION").into(),
+                address: self.node_address.ip.clone(),
+                port: self.node_address.port as u32,
+                wg_pubkey: String::new(),
             })
             .await
             .context("registration failed")?;

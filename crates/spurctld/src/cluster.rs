@@ -305,11 +305,17 @@ impl ClusterManager {
         name: String,
         resources: ResourceSet,
         address: String,
+        port: u16,
+        wg_pubkey: String,
         version: String,
     ) {
         let mut node = Node::new(name.clone(), resources.clone());
         node.state = NodeState::Idle;
         node.address = Some(address.clone());
+        node.port = port;
+        if !wg_pubkey.is_empty() {
+            node.wg_pubkey = Some(wg_pubkey);
+        }
         node.version = Some(version);
         node.agent_start_time = Some(Utc::now());
         node.last_heartbeat = Some(Utc::now());

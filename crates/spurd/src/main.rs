@@ -55,12 +55,30 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "unknown".into())
     });
 
+    // Parse listen port from the listen address for registration
+    let listen_port: u16 = args
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(6818);
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
         hostname = %hostname,
         controller = %args.controller,
         listen = %args.listen,
         "spurd starting"
+    );
+
+    // Detect node address (WireGuard > hostname)
+    let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+    let node_address = spur_net::detect_node_address(&hostname, listen_port, &wg_interface);
+    info!(
+        ip = %node_address.ip,
+        port = node_address.port,
+        source = ?node_address.source,
+        "node address detected"
     );
 
     // Discover local resources
@@ -77,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         hostname.clone(),
         args.controller.clone(),
         resources,
+        node_address,
     ));
 
     // Register with controller

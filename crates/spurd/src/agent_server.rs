@@ -100,9 +100,17 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
+        let peer_nodes = req.peer_nodes;
+        let task_offset = req.task_offset;
         let spec = req.spec.ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
-        info!(job_id, name = %spec.name, "received job launch request");
+        info!(
+            job_id,
+            name = %spec.name,
+            task_offset,
+            num_peers = peer_nodes.len(),
+            "received job launch request"
+        );
 
         let work_dir = if spec.work_dir.is_empty() {
             "/tmp".to_string()
@@ -123,12 +131,21 @@ impl SlurmAgent for AgentService {
             spec.script.clone()
         };
 
+        // Inject peer node info as environment variables for MPI/distributed apps
+        let mut env = spec.environment.clone();
+        env.insert("SPUR_JOB_ID".into(), job_id.to_string());
+        env.insert("SPUR_TASK_OFFSET".into(), task_offset.to_string());
+        env.insert("SPUR_NUM_NODES".into(), peer_nodes.len().to_string());
+        if !peer_nodes.is_empty() {
+            env.insert("SPUR_PEER_NODES".into(), peer_nodes.join(","));
+        }
+
         // Launch the job
         match executor::launch_job(
             job_id,
             &script,
             &work_dir,
-            &spec.environment,
+            &env,
             &spec.stdout_path,
             &spec.stderr_path,
             spec.cpus_per_task.max(1),

@@ -2248,6 +2248,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spur-core",
+ "spur-net",
  "spur-proto",
  "thiserror",
  "tokio",
@@ -2291,6 +2292,18 @@ name = "spur-k8s"
 version = "0.1.0"
 dependencies = [
  "spur-core",
+]
+
+[[package]]
+name = "spur-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2397,6 +2410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spur-core",
+ "spur-net",
  "spur-proto",
  "tokio",
  "tokio-stream",

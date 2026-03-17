@@ -1,4 +1,5 @@
 mod format_engine;
+mod net;
 mod sacct;
 mod sacctmgr;
 mod sbatch;
@@ -44,6 +45,7 @@ fn main() -> anyhow::Result<()> {
 
     match args[1].as_str() {
         // Native spur commands
+        "net" => runtime.block_on(net::main()),
         "submit" => runtime.block_on(sbatch::main()),
         "run" => runtime.block_on(srun::main()),
         "queue" | "jobs" => runtime.block_on(squeue::main()),
@@ -86,6 +88,7 @@ fn print_usage() {
     eprintln!("Usage: spur <command> [args...]");
     eprintln!();
     eprintln!("Commands:");
+    eprintln!("  net         Manage WireGuard mesh network (init/join/status)");
     eprintln!("  submit      Submit a batch job script");
     eprintln!("  run         Run a parallel job (interactive)");
     eprintln!("  queue       View the job queue");

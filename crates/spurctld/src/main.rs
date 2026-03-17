@@ -113,6 +113,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             preempt_mode: String::new(),
         }],
         nodes: Vec::new(),
+        network: Default::default(),
         logging: Default::default(),
     }
 }

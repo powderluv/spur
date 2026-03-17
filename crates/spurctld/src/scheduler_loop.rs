@@ -93,28 +93,66 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 continue;
             }
 
-            // Dispatch job to the first assigned node's agent
-            let first_node = &assignment.nodes[0];
-            let node_addr = cluster
-                .get_node(first_node)
-                .and_then(|n| n.address.clone());
+            // Dispatch job to ALL assigned nodes
+            let job_id = assignment.job_id;
+            let spec = job.spec.clone();
+            let all_nodes = assignment.nodes.clone();
 
-            if let Some(addr) = node_addr {
-                let job_id = assignment.job_id;
-                let spec = job.spec.clone();
-                let agent_addr = format!("http://{}:6818", addr);
+            // Build peer_nodes list with addresses for cross-node communication
+            let peer_addrs: Vec<String> = all_nodes
+                .iter()
+                .filter_map(|name| {
+                    cluster.get_node(name).and_then(|n| {
+                        n.address.as_ref().map(|a| format!("{}:{}", a, n.port))
+                    })
+                })
+                .collect();
+
+            let tasks_per_node = if let Some(tpn) = spec.tasks_per_node {
+                tpn
+            } else {
+                (spec.num_tasks / spec.num_nodes.max(1)).max(1)
+            };
+
+            for (node_idx, node_name) in all_nodes.iter().enumerate() {
+                let node_info = cluster.get_node(node_name);
+                let (addr, port) = match node_info {
+                    Some(ref n) if n.address.is_some() => {
+                        (n.address.clone().unwrap(), n.port)
+                    }
+                    _ => {
+                        warn!(
+                            job_id,
+                            node = %node_name,
+                            "no agent address for node, skipping dispatch"
+                        );
+                        continue;
+                    }
+                };
+
+                let agent_addr = format!("http://{}:{}", addr, port);
+                let spec = spec.clone();
+                let peer_addrs = peer_addrs.clone();
+                let task_offset = node_idx as u32 * tasks_per_node;
 
                 tokio::spawn(async move {
-                    if let Err(e) = dispatch_to_agent(&agent_addr, job_id, &spec).await {
-                        error!(job_id, agent = %agent_addr, error = %e, "failed to dispatch job to agent");
+                    if let Err(e) = dispatch_to_agent(
+                        &agent_addr,
+                        job_id,
+                        &spec,
+                        &peer_addrs,
+                        task_offset,
+                    )
+                    .await
+                    {
+                        error!(
+                            job_id,
+                            agent = %agent_addr,
+                            error = %e,
+                            "failed to dispatch job to agent"
+                        );
                     }
                 });
-            } else {
-                warn!(
-                    job_id = assignment.job_id,
-                    node = %first_node,
-                    "no agent address for node, job will not execute"
-                );
             }
         }
     }
@@ -174,6 +212,8 @@ async fn dispatch_to_agent(
     agent_addr: &str,
     job_id: u32,
     spec: &spur_core::job::JobSpec,
+    peer_nodes: &[String],
+    task_offset: u32,
 ) -> anyhow::Result<()> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string()).await?;
 
@@ -221,6 +261,8 @@ async fn dispatch_to_agent(
             job_id,
             spec: Some(proto_spec),
             allocated: None,
+            peer_nodes: peer_nodes.to_vec(),
+            task_offset,
         })
         .await?;
 

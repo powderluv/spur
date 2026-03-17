@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/spur-proto",
     "crates/spur-core",
+    "crates/spur-net",
     "crates/spur-sched",
     "crates/spur-state",
     "crates/spurctld",

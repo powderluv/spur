@@ -44,6 +44,9 @@ pub struct SlurmConfig {
     pub nodes: Vec<NodeConfig>,
 
     #[serde(default)]
+    pub network: NetworkConfig,
+
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -210,6 +213,43 @@ pub struct NodeConfig {
     pub features: Vec<String>,
     /// Override address (if different from hostname).
     pub address: Option<String>,
+}
+
+/// Network / WireGuard mesh configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Enable WireGuard mesh networking between nodes.
+    #[serde(default)]
+    pub wg_enabled: bool,
+    /// CIDR block for WireGuard address allocation (default: 10.44.0.0/16).
+    #[serde(default = "default_wg_cidr")]
+    pub wg_cidr: String,
+    /// WireGuard interface name (default: spur0).
+    #[serde(default = "default_wg_interface")]
+    pub wg_interface: String,
+    /// WireGuard listen port (default: 51820).
+    #[serde(default = "default_wg_port")]
+    pub wg_port: u16,
+    /// Agent gRPC listen port (default: 6818).
+    #[serde(default = "default_agent_port")]
+    pub agent_port: u16,
+}
+
+fn default_wg_cidr() -> String { "10.44.0.0/16".into() }
+fn default_wg_interface() -> String { "spur0".into() }
+fn default_wg_port() -> u16 { 51820 }
+fn default_agent_port() -> u16 { 6818 }
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            wg_enabled: false,
+            wg_cidr: "10.44.0.0/16".into(),
+            wg_interface: "spur0".into(),
+            wg_port: 51820,
+            agent_port: 6818,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -79,6 +79,10 @@ pub struct Node {
 
     /// Agent address for gRPC communication.
     pub address: Option<String>,
+    /// Agent gRPC listen port.
+    pub port: u16,
+    /// WireGuard public key (for mesh setup).
+    pub wg_pubkey: Option<String>,
     /// Agent version.
     pub version: Option<String>,
 }
@@ -101,6 +105,8 @@ impl Node {
             agent_start_time: None,
             last_heartbeat: None,
             address: None,
+            port: 6818,
+            wg_pubkey: None,
             version: None,
         }
     }

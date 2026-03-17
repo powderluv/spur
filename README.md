@@ -4,6 +4,8 @@ A clean-room HPC job scheduler written in Rust. Drop-in compatible with Slurm's 
 
 ## Quick Start
 
+**See [docs/quickstart.md](docs/quickstart.md) for the full walkthrough** — single-node setup in 5 minutes, multi-node with WireGuard mesh, GPU job examples, and troubleshooting.
+
 ### Build
 
 ```bash
@@ -241,17 +243,19 @@ memory_mb = 1024000
 ```
 spur/
 ├── proto/slurm.proto           # gRPC service definitions
+├── docs/quickstart.md          # Getting started guide
 ├── crates/
 │   ├── spur-proto/             # Generated gRPC code
 │   ├── spur-core/              # Job, Node, ResourceSet, config, hostlist, WAL
+│   ├── spur-net/               # WireGuard mesh networking, address detection
 │   ├── spur-sched/             # Backfill scheduler, priority, timeline
 │   ├── spur-state/             # WAL persistence, redb snapshots
 │   ├── spurctld/               # Controller daemon
 │   ├── spurd/                  # Node agent daemon
 │   ├── spurdbd/                # Accounting daemon
 │   ├── spurrestd/              # REST API daemon
-│   ├── spur-cli/               # CLI binary
-│   ├── spur-ffi/               # C FFI shim
+│   ├── spur-cli/               # CLI binary (multi-call: spur, sbatch, squeue, ...)
+│   ├── spur-ffi/               # C FFI shim (libspur_compat.so)
 │   ├── spur-spank/             # SPANK plugin host
 │   ├── spur-k8s/               # K8s integration (post-MVP)
 │   └── spur-tests/             # Test suite (mirrors Slurm numbering)
@@ -260,7 +264,7 @@ spur/
 ## Testing
 
 ```bash
-cargo test                    # Run all 176 tests
+cargo test                    # Run all 314 tests
 cargo test -p spur-tests      # Run integration test suite only
 cargo test -p spur-core       # Run core library tests only
 ```

@@ -313,6 +313,9 @@ message RegisterAgentRequest {
   string hostname = 1;
   ResourceSet resources = 2;
   string version = 3;
+  string address = 4;        // Agent's preferred IP (e.g. WireGuard 10.44.x.y)
+  uint32 port = 5;           // Agent gRPC listen port
+  string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
 }
 
 message RegisterAgentResponse {
@@ -344,6 +347,8 @@ message LaunchJobRequest {
   uint32 job_id = 1;
   JobSpec spec = 2;
   ResourceSet allocated = 3;
+  repeated string peer_nodes = 4;  // All nodes in this job's allocation
+  uint32 task_offset = 5;          // This node's starting task index
 }
 
 message LaunchJobResponse {
