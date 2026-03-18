@@ -137,6 +137,22 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub container_readonly: bool,
 
+    /// Mount user home directory in container
+    #[arg(long)]
+    pub container_mount_home: bool,
+
+    /// Set environment variable inside container (KEY=VAL)
+    #[arg(long)]
+    pub container_env: Vec<String>,
+
+    /// Override container entrypoint
+    #[arg(long)]
+    pub container_entrypoint: Option<String>,
+
+    /// Remap user to root inside container
+    #[arg(long)]
+    pub container_remap_root: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -399,6 +415,17 @@ pub async fn main() -> Result<()> {
         container_workdir: args.container_workdir.unwrap_or_default(),
         container_name: args.container_name.unwrap_or_default(),
         container_readonly: args.container_readonly,
+        container_mount_home: args.container_mount_home,
+        container_env: args
+            .container_env
+            .iter()
+            .filter_map(|s| {
+                s.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect(),
+        container_entrypoint: args.container_entrypoint.unwrap_or_default(),
+        container_remap_root: args.container_remap_root,
     };
 
     // Submit to controller

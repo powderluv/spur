@@ -23,3 +23,5 @@ prost-types = { workspace = true }
 whoami = "2.1.1"
 atty = "0.2.14"
 nix = { workspace = true, features = ["user"] }
+flate2 = { workspace = true }
+tar = { workspace = true }

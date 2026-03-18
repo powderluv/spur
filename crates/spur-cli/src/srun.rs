@@ -77,6 +77,18 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_workdir: Option<String>,
 
+    /// Mount user home directory in container
+    #[arg(long)]
+    pub container_mount_home: bool,
+
+    /// Set environment variable inside container (KEY=VAL)
+    #[arg(long)]
+    pub container_env: Vec<String>,
+
+    /// Remap user to root inside container
+    #[arg(long)]
+    pub container_remap_root: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -163,6 +175,16 @@ pub async fn main() -> Result<()> {
         container_image: args.container_image.unwrap_or_default(),
         container_mounts: args.container_mounts,
         container_workdir: args.container_workdir.unwrap_or_default(),
+        container_mount_home: args.container_mount_home,
+        container_env: args
+            .container_env
+            .iter()
+            .filter_map(|s| {
+                s.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect(),
+        container_remap_root: args.container_remap_root,
         ..Default::default()
     };
 

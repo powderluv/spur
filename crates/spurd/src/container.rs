@@ -37,8 +37,16 @@ pub struct ContainerConfig {
     pub workdir: Option<String>,
     pub name: Option<String>,
     pub readonly: bool,
+    pub mount_home: bool,
+    pub remap_root: bool,
     pub gpu_devices: Vec<u32>,
     pub environment: HashMap<String, String>,
+    pub container_env: HashMap<String, String>,
+    pub entrypoint: Option<String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub username: String,
+    pub home_dir: String,
 }
 
 /// Resolve image reference to a rootfs path.
@@ -134,9 +142,14 @@ pub fn setup_rootfs(image_path: &Path, job_id: u32, name: Option<&str>) -> anyho
 
 /// Build the wrapper script that launches a job inside a container.
 ///
-/// Uses `unshare` to create user + mount namespaces, then `chroot` into the
-/// rootfs. This approach works without root — requires
-/// `sysctl kernel.unprivileged_userns_clone=1` (default on most distros).
+/// Implements Enroot-equivalent hooks:
+/// - shadow: map host user into container /etc/passwd + /etc/group
+/// - home: bind-mount user home directory
+/// - devices: restrict /dev or passthrough GPU devices
+/// - nvidia: bind-mount NVIDIA driver libs + devices
+/// - rocm: bind-mount AMD ROCm libs + /dev/kfd + /dev/dri
+/// - mellanox: bind-mount InfiniBand devices + MOFED libs
+/// - cgroups: already handled by executor.rs
 pub fn build_container_launch_script(
     config: &ContainerConfig,
     rootfs: &Path,
@@ -150,27 +163,48 @@ pub fn build_container_launch_script(
 
     // Ensure key directories exist in rootfs
     script.push_str(&format!(
-        "mkdir -p {rootfs}/dev {rootfs}/proc {rootfs}/sys {rootfs}/tmp\n",
+        "mkdir -p {rootfs}/dev {rootfs}/proc {rootfs}/sys {rootfs}/tmp {rootfs}/etc {rootfs}/run\n",
         rootfs = rootfs_str
     ));
 
-    // Copy the job script into the rootfs before entering namespace
+    // --- Hook: shadow (user mapping) ---
+    // Map host user into container's /etc/passwd and /etc/group
+    script.push_str(&format!(
+        r#"
+# Hook: shadow — map host user into container
+if [ -f {rootfs}/etc/passwd ]; then
+  grep -q "^{username}:" {rootfs}/etc/passwd 2>/dev/null || \
+    echo "{username}:x:{uid}:{gid}::{home}:/bin/bash" >> {rootfs}/etc/passwd
+fi
+if [ -f {rootfs}/etc/group ]; then
+  grep -q "^{username}:" {rootfs}/etc/group 2>/dev/null || \
+    echo "{username}:x:{gid}:" >> {rootfs}/etc/group
+fi
+mkdir -p {rootfs}{home}
+"#,
+        rootfs = rootfs_str,
+        username = config.username,
+        uid = config.uid,
+        gid = config.gid,
+        home = config.home_dir,
+    ));
+
+    // Copy the job script into the rootfs
     let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs_str, job_id);
     script.push_str(&format!(
         "cp \"{}\" \"{}\"\nchmod +x \"{}\"\n",
         inner_script_path, container_script, container_script
     ));
 
-    // Copy user-mounted source files/dirs into rootfs (for unprivileged mode)
-    // In privileged mode we'd use bind mounts; unprivileged uses copies or symlinks
+    // Pre-create mount targets
     for mount in &config.mounts {
         let target = format!("{}{}", rootfs_str, mount.target);
         script.push_str(&format!("mkdir -p \"{}\"\n", target));
     }
 
-    // GPU visibility env vars (only these need explicit setting;
-    // the rest of the environment is inherited from the executor)
+    // Build container-specific env exports
     let mut env_exports = String::new();
+    // GPU visibility
     if !config.gpu_devices.is_empty() {
         let gpu_list: String = config
             .gpu_devices
@@ -179,65 +213,124 @@ pub fn build_container_launch_script(
             .collect::<Vec<_>>()
             .join(",");
         env_exports.push_str(&format!(
-            "export ROCR_VISIBLE_DEVICES={gl}\nexport CUDA_VISIBLE_DEVICES={gl}\n",
+            "export ROCR_VISIBLE_DEVICES={gl}\nexport CUDA_VISIBLE_DEVICES={gl}\nexport GPU_DEVICE_ORDINAL={gl}\n",
             gl = gpu_list
         ));
+    }
+    // User-specified container env vars (--container-env KEY=VAL)
+    for (key, value) in &config.container_env {
+        let escaped = value.replace('\'', "'\\''");
+        env_exports.push_str(&format!("export {}='{}'\n", key, escaped));
     }
 
     let workdir = config.workdir.as_deref().unwrap_or("/tmp");
 
-    // Three modes depending on privilege level:
-    // 1. Root: unshare --mount + chroot (full isolation)
-    // 2. Non-root with userns: unshare --user --mount + chroot
-    // 3. Non-root fallback: run directly using container's libraries via PATH/LD_LIBRARY_PATH
-    //
-    // In production, spurd typically runs as root for cgroup management.
-    // Mode 3 provides a degraded but functional path for dev/testing.
+    // Build entrypoint prefix if specified
+    let entrypoint_cmd = if let Some(ref ep) = config.entrypoint {
+        format!("{} && ", ep)
+    } else {
+        String::new()
+    };
+
+    // === ROOT MODE: full namespace + chroot ===
     script.push_str(&format!(
         r#"
-# Try namespace isolation, fall back to PATH-based execution
 if [ "$(id -u)" = "0" ]; then
-  # Root: full mount namespace + chroot
   exec unshare --mount bash -c '
 set -e
-
 ROOTFS="{rootfs}"
 
-# Mount filesystems inside container
+# Hook: filesystem mounts
 mount -t proc proc $ROOTFS/proc 2>/dev/null || true
 mount -t sysfs sys $ROOTFS/sys 2>/dev/null || true
-mount --bind /dev $ROOTFS/dev 2>/dev/null || true
+mount -t tmpfs tmpfs $ROOTFS/run 2>/dev/null || true
+"#,
+        rootfs = rootfs_str,
+    ));
 
-# GPU devices (AMD + NVIDIA)
+    // Hook: devices — restricted /dev with only essential devices
+    script.push_str(
+        r#"
+# Hook: devices — minimal /dev + GPU passthrough
+mount -t tmpfs -o mode=755 tmpfs $ROOTFS/dev
+mkdir -p $ROOTFS/dev/pts $ROOTFS/dev/shm $ROOTFS/dev/mqueue
+mount -t devpts devpts $ROOTFS/dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs $ROOTFS/dev/shm 2>/dev/null || true
+# Essential devices
+for d in null zero random urandom tty console; do
+  touch $ROOTFS/dev/$d 2>/dev/null
+  mount --bind /dev/$d $ROOTFS/dev/$d 2>/dev/null || true
+done
+ln -sf /proc/self/fd $ROOTFS/dev/fd 2>/dev/null || true
+ln -sf /proc/self/fd/0 $ROOTFS/dev/stdin 2>/dev/null || true
+ln -sf /proc/self/fd/1 $ROOTFS/dev/stdout 2>/dev/null || true
+ln -sf /proc/self/fd/2 $ROOTFS/dev/stderr 2>/dev/null || true
+
+# Hook: GPU — AMD (ROCm)
 if [ -d /dev/dri ]; then
   mkdir -p $ROOTFS/dev/dri
   mount --bind /dev/dri $ROOTFS/dev/dri 2>/dev/null || true
 fi
 if [ -e /dev/kfd ]; then
-  touch $ROOTFS/dev/kfd 2>/dev/null || true
+  touch $ROOTFS/dev/kfd 2>/dev/null
   mount --bind /dev/kfd $ROOTFS/dev/kfd 2>/dev/null || true
 fi
-
-# ROCm libraries
-for p in /opt/rocm /opt/rocm/lib; do
+for p in /opt/rocm /opt/rocm/lib /opt/rocm/lib64; do
   if [ -d "$p" ]; then
     mkdir -p $ROOTFS$p
     mount --bind $p $ROOTFS$p 2>/dev/null || true
   fi
 done
 
-# NVIDIA device files
+# Hook: GPU — NVIDIA
 for dev in /dev/nvidia*; do
   if [ -e "$dev" ]; then
     touch $ROOTFS$dev 2>/dev/null || true
     mount --bind $dev $ROOTFS$dev 2>/dev/null || true
   fi
 done
-"#,
-        rootfs = rootfs_str,
-    ));
+for libdir in /usr/lib/x86_64-linux-gnu /usr/lib64; do
+  if ls $libdir/libnvidia* 1>/dev/null 2>&1; then
+    mkdir -p $ROOTFS$libdir
+    for lib in $libdir/libnvidia* $libdir/libcuda* $libdir/libnvoptix*; do
+      [ -e "$lib" ] && mount --bind $lib $ROOTFS$lib 2>/dev/null || true
+    done
+  fi
+done
 
-    // User bind mounts (inside the namespace)
+# Hook: InfiniBand / Mellanox (MOFED)
+if [ -d /dev/infiniband ]; then
+  mkdir -p $ROOTFS/dev/infiniband
+  mount --bind /dev/infiniband $ROOTFS/dev/infiniband 2>/dev/null || true
+fi
+for ibdev in /dev/uverbs* /dev/rdma_cm; do
+  if [ -e "$ibdev" ]; then
+    touch $ROOTFS$ibdev 2>/dev/null || true
+    mount --bind $ibdev $ROOTFS$ibdev 2>/dev/null || true
+  fi
+done
+for mofed in /etc/libibverbs.d /usr/lib/x86_64-linux-gnu/libibverbs /usr/lib64/libibverbs; do
+  if [ -d "$mofed" ]; then
+    mkdir -p $ROOTFS$mofed
+    mount --bind $mofed $ROOTFS$mofed 2>/dev/null || true
+  fi
+done
+"#,
+    );
+
+    // Hook: home — bind-mount user home directory
+    if config.mount_home {
+        script.push_str(&format!(
+            r#"
+# Hook: home — mount user home directory
+mkdir -p $ROOTFS{home}
+mount --bind {home} $ROOTFS{home} 2>/dev/null || true
+"#,
+            home = config.home_dir,
+        ));
+    }
+
+    // User bind mounts
     for mount in &config.mounts {
         script.push_str(&format!(
             "\nmkdir -p $ROOTFS{target}\nmount --bind \"{source}\" $ROOTFS{target} 2>/dev/null || true",
@@ -252,31 +345,66 @@ done
         }
     }
 
-    // Chroot and execute (inside the namespace)
-    script.push_str(&format!(
+    // Hook: config.d — source any system/user hook scripts
+    script.push_str(
         r#"
 
+# Hook: config.d — run hook scripts from /etc/spur/container.d/hooks.d/
+for hook in /etc/spur/container.d/hooks.d/*.sh; do
+  [ -x "$hook" ] && ENROOT_ROOTFS=$ROOTFS ENROOT_PID=$$ . "$hook" 2>/dev/null || true
+done
+
+# Hook: environ.d — source extra environment files
+for envf in /etc/spur/container.d/environ.d/*.env; do
+  [ -f "$envf" ] && while IFS= read -r line; do
+    [ -n "$line" ] && [ "${line#\#}" = "$line" ] && export "$line"
+  done < "$envf"
+done
+
+# Hook: mounts.d — process extra mount specs
+for fstab in /etc/spur/container.d/mounts.d/*.fstab; do
+  [ -f "$fstab" ] && while IFS= read -r line; do
+    [ -n "$line" ] && [ "${line#\#}" = "$line" ] && {
+      src=$(echo "$line" | awk "{print \$1}")
+      dst=$(echo "$line" | awk "{print \$2}")
+      [ -n "$src" ] && [ -n "$dst" ] && {
+        mkdir -p $ROOTFS$dst
+        mount --bind "$src" $ROOTFS$dst 2>/dev/null || true
+      }
+    }
+  done < "$fstab"
+done
+"#,
+    );
+
+    // Chroot and execute
+    script.push_str(&format!(
+        r#"
 # Set environment
 {env_exports}
 
-# Chroot into container
-chroot $ROOTFS /bin/bash -c "cd {workdir} && /tmp/spur_job_{job_id}.sh"
+# Enter container
+chroot $ROOTFS /bin/bash -c "cd {workdir} && {entrypoint}{script}"
 '
 else
-  # Non-root fallback: no namespace isolation, run with container PATH/libs
+  # Non-root fallback: PATH-based execution, no namespace isolation
   ROOTFS="{rootfs}"
   {env_exports}
   export PATH="$ROOTFS/usr/bin:$ROOTFS/bin:$ROOTFS/usr/sbin:$ROOTFS/sbin:$PATH"
   export LD_LIBRARY_PATH="$ROOTFS/usr/lib:$ROOTFS/lib:$ROOTFS/usr/lib64:$ROOTFS/lib64:${{LD_LIBRARY_PATH:-}}"
   export SPUR_CONTAINER_ROOTFS="$ROOTFS"
+  export HOME="{home}"
   cd {workdir}
-  /bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
+  {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
 fi
 "#,
         env_exports = env_exports,
         workdir = workdir,
         job_id = job_id,
         rootfs = rootfs_str,
+        home = config.home_dir,
+        entrypoint = entrypoint_cmd,
+        script = format!("/tmp/spur_job_{}.sh", job_id),
     ));
 
     Ok(script)
@@ -566,8 +694,16 @@ mod tests {
             workdir: None,
             name: None,
             readonly: false,
+            mount_home: false,
+            remap_root: false,
             gpu_devices: vec![0, 1],
             environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
         };
         let script = build_gpu_mounts(&config, "/tmp/rootfs");
         // AMD devices
@@ -589,8 +725,16 @@ mod tests {
             workdir: None,
             name: None,
             readonly: false,
+            mount_home: false,
+            remap_root: false,
             gpu_devices: vec![],
             environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
         };
         let script = build_gpu_mounts(&config, "/tmp/rootfs");
         // Should still mount device dirs (if they exist on host)
@@ -610,8 +754,16 @@ mod tests {
             workdir: None,
             name: None,
             readonly: false,
+            mount_home: false,
+            remap_root: false,
             gpu_devices: vec![],
             environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
         };
         let rootfs = Path::new("/tmp/test-rootfs");
         let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 42).unwrap();
@@ -636,8 +788,16 @@ mod tests {
             workdir: Some("/workspace".into()),
             name: None,
             readonly: false,
+            mount_home: false,
+            remap_root: false,
             gpu_devices: vec![],
             environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
         };
         let rootfs = Path::new("/tmp/test-rootfs");
         let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
@@ -664,8 +824,16 @@ mod tests {
             workdir: None,
             name: None,
             readonly: false,
+            mount_home: false,
+            remap_root: false,
             gpu_devices: vec![],
             environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
         };
         let rootfs = Path::new("/tmp/test-rootfs");
         let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
@@ -718,5 +886,214 @@ mod tests {
     #[test]
     fn test_which_not_found() {
         assert!(!which("nonexistent-binary-that-doesnt-exist-xyz"));
+    }
+
+    // --- New hook tests ---
+
+    #[test]
+    fn test_launch_script_has_shadow_hook() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "alice".into(),
+            home_dir: "/home/alice".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        // Shadow hook: maps user into container
+        assert!(script.contains("alice:x:1000:1000"));
+        assert!(script.contains("/etc/passwd"));
+        assert!(script.contains("/etc/group"));
+    }
+
+    #[test]
+    fn test_launch_script_mount_home() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: true,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "alice".into(),
+            home_dir: "/home/alice".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        assert!(script.contains("mount --bind /home/alice"));
+    }
+
+    #[test]
+    fn test_launch_script_no_mount_home_by_default() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "alice".into(),
+            home_dir: "/home/alice".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        assert!(!script.contains("Hook: home"));
+    }
+
+    #[test]
+    fn test_launch_script_has_infiniband_hook() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        assert!(script.contains("/dev/infiniband"));
+        assert!(script.contains("libibverbs"));
+    }
+
+    #[test]
+    fn test_launch_script_has_restricted_dev() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        // Restricted /dev with essential devices only
+        assert!(script.contains("tmpfs tmpfs $ROOTFS/dev"));
+        assert!(script.contains("null zero random urandom tty console"));
+        assert!(script.contains("/dev/pts"));
+        assert!(script.contains("/dev/shm"));
+    }
+
+    #[test]
+    fn test_launch_script_container_env() {
+        let mut container_env = HashMap::new();
+        container_env.insert("MY_VAR".into(), "my_value".into());
+        container_env.insert("ANOTHER".into(), "val2".into());
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env,
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        assert!(script.contains("MY_VAR='my_value'"));
+        assert!(script.contains("ANOTHER='val2'"));
+    }
+
+    #[test]
+    fn test_launch_script_entrypoint() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: Some("/entrypoint.sh".into()),
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        assert!(script.contains("/entrypoint.sh &&"));
+    }
+
+    #[test]
+    fn test_launch_script_config_hooks() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        // Config hook directories
+        assert!(script.contains("container.d/hooks.d"));
+        assert!(script.contains("container.d/environ.d"));
+        assert!(script.contains("container.d/mounts.d"));
     }
 }

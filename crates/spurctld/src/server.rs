@@ -384,6 +384,14 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.container_name)
         },
         container_readonly: spec.container_readonly,
+        container_mount_home: spec.container_mount_home,
+        container_env: spec.container_env,
+        container_entrypoint: if spec.container_entrypoint.is_empty() {
+            None
+        } else {
+            Some(spec.container_entrypoint)
+        },
+        container_remap_root: spec.container_remap_root,
     })
 }
 

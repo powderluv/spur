@@ -284,21 +284,185 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
     Ok(())
 }
 
+/// Registry credentials loaded from file or environment.
+#[derive(Debug, Clone)]
+pub struct RegistryCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Load credentials for a registry from:
+/// 1. Environment: SPUR_REGISTRY_USER + SPUR_REGISTRY_PASSWORD
+/// 2. Credentials file: ~/.config/spur/credentials (netrc format)
+/// 3. Docker config: ~/.docker/config.json (for compat)
+pub fn load_credentials(registry: &str) -> Option<RegistryCredentials> {
+    // 1. Environment variables
+    if let (Ok(user), Ok(pass)) = (
+        std::env::var("SPUR_REGISTRY_USER"),
+        std::env::var("SPUR_REGISTRY_PASSWORD"),
+    ) {
+        if !user.is_empty() {
+            return Some(RegistryCredentials {
+                username: user,
+                password: pass,
+            });
+        }
+    }
+
+    // 2. Spur credentials file (netrc format: machine <registry> login <user> password <pass>)
+    let cred_path = dirs_credentials_path();
+    if let Ok(content) = std::fs::read_to_string(&cred_path) {
+        if let Some(cred) = parse_netrc(&content, registry) {
+            return Some(cred);
+        }
+    }
+
+    // 3. Docker config.json (base64 encoded "user:pass" in auths)
+    if let Some(cred) = load_docker_config_auth(registry) {
+        return Some(cred);
+    }
+
+    None
+}
+
+fn dirs_credentials_path() -> PathBuf {
+    if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(config).join("spur/credentials")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/spur/credentials")
+    } else {
+        PathBuf::from("/etc/spur/credentials")
+    }
+}
+
+fn parse_netrc(content: &str, registry: &str) -> Option<RegistryCredentials> {
+    let mut machine_match = false;
+    let mut username = None;
+    let mut password = None;
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "machine" if i + 1 < tokens.len() => {
+                machine_match = tokens[i + 1] == registry
+                    || (registry == "docker.io" && tokens[i + 1] == "registry-1.docker.io");
+                username = None;
+                password = None;
+                i += 2;
+            }
+            "login" if machine_match && i + 1 < tokens.len() => {
+                username = Some(tokens[i + 1].to_string());
+                i += 2;
+            }
+            "password" if machine_match && i + 1 < tokens.len() => {
+                password = Some(tokens[i + 1].to_string());
+                i += 2;
+            }
+            _ => i += 1,
+        }
+        if machine_match && username.is_some() && password.is_some() {
+            return Some(RegistryCredentials {
+                username: username.unwrap(),
+                password: password.unwrap(),
+            });
+        }
+    }
+    None
+}
+
+fn load_docker_config_auth(registry: &str) -> Option<RegistryCredentials> {
+    let docker_config = if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".docker/config.json")
+    } else {
+        return None;
+    };
+
+    let content = std::fs::read_to_string(&docker_config).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let auths = config.get("auths")?;
+
+    // Try exact match and common aliases
+    let keys_to_try = if registry == "docker.io" {
+        vec![
+            "docker.io",
+            "https://index.docker.io/v1/",
+            "registry-1.docker.io",
+        ]
+    } else {
+        vec![registry]
+    };
+
+    for key in keys_to_try {
+        if let Some(entry) = auths.get(key) {
+            if let Some(auth_b64) = entry.get("auth").and_then(|a| a.as_str()) {
+                use std::io::Read;
+                let decoded = base64_decode(auth_b64)?;
+                let (user, pass) = decoded.split_once(':')?;
+                return Some(RegistryCredentials {
+                    username: user.to_string(),
+                    password: pass.to_string(),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn base64_decode(input: &str) -> Option<String> {
+    // Simple base64 decode without pulling in a crate
+    let input = input.trim();
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter_map(|b| match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => None,
+            _ => None,
+        })
+        .collect();
+
+    let mut result = Vec::new();
+    for chunk in bytes.chunks(4) {
+        if chunk.len() >= 2 {
+            result.push((chunk[0] << 2) | (chunk[1] >> 4));
+        }
+        if chunk.len() >= 3 {
+            result.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        if chunk.len() >= 4 {
+            result.push((chunk[2] << 6) | chunk[3]);
+        }
+    }
+
+    String::from_utf8(result).ok()
+}
+
 /// Get an auth token from the registry.
 ///
-/// Docker Hub uses token auth: GET https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/ubuntu:pull
-/// Other registries may use anonymous access or different auth.
+/// Supports:
+/// - Docker Hub token auth
+/// - Basic auth with credentials from file/env
+/// - Anonymous access for public images
 async fn get_auth_token(
     client: &reqwest::Client,
     image_ref: &ImageRef,
 ) -> anyhow::Result<Option<String>> {
+    let creds = load_credentials(&image_ref.registry);
+
     if image_ref.registry == "docker.io" {
         let url = format!(
             "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{}:pull",
             image_ref.repository
         );
-        let resp = client
-            .get(&url)
+        let mut req = client.get(&url);
+        if let Some(ref creds) = creds {
+            req = req.basic_auth(&creds.username, Some(&creds.password));
+        }
+        let resp = req
             .send()
             .await
             .context("failed to get Docker Hub auth token")?;
@@ -308,8 +472,48 @@ async fn get_auth_token(
         }
     }
 
-    // Try anonymous access — many registries support it for public images
+    // For non-Docker Hub registries with credentials, use basic auth
+    // The token will be passed as-is (basic auth encoded)
+    if let Some(creds) = creds {
+        use std::fmt::Write;
+        let mut basic = String::new();
+        write!(
+            basic,
+            "Basic {}",
+            encode_basic_auth(&creds.username, &creds.password)
+        )
+        .ok();
+        return Ok(Some(basic));
+    }
+
+    // Try anonymous access
     Ok(None)
+}
+
+fn encode_basic_auth(user: &str, pass: &str) -> String {
+    let input = format!("{}:{}", user, pass);
+    let mut result = String::new();
+    let b64_chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(b64_chars[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(b64_chars[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(b64_chars[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(b64_chars[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }
 
 /// Resolve a manifest list (multi-arch) to a single amd64/linux manifest.

@@ -171,6 +171,10 @@ pub struct JobSpec {
     pub container_workdir: Option<String>,
     pub container_name: Option<String>,
     pub container_readonly: bool,
+    pub container_mount_home: bool,
+    pub container_env: HashMap<String, String>,
+    pub container_entrypoint: Option<String>,
+    pub container_remap_root: bool,
 }
 
 impl Default for JobSpec {
@@ -214,6 +218,10 @@ impl Default for JobSpec {
             container_workdir: None,
             container_name: None,
             container_readonly: false,
+            container_mount_home: false,
+            container_env: HashMap::new(),
+            container_entrypoint: None,
+            container_remap_root: false,
         }
     }
 }

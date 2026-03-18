@@ -151,6 +151,12 @@ impl SlurmAgent for AgentService {
                 .filter_map(|m| crate::container::parse_mount(m).ok())
                 .collect();
 
+            // Resolve user info for shadow hook
+            let username = spec.user.clone();
+            let uid = spec.uid;
+            let gid = spec.gid;
+            let home_dir = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", username));
+
             let container_config = crate::container::ContainerConfig {
                 image: spec.container_image.clone(),
                 mounts,
@@ -165,8 +171,24 @@ impl SlurmAgent for AgentService {
                     Some(spec.container_name.clone())
                 },
                 readonly: spec.container_readonly,
+                mount_home: spec.container_mount_home,
+                remap_root: spec.container_remap_root,
                 gpu_devices: vec![], // TODO: from GRES allocation
                 environment: env.clone(),
+                container_env: spec.container_env.clone(),
+                entrypoint: if spec.container_entrypoint.is_empty() {
+                    None
+                } else {
+                    Some(spec.container_entrypoint.clone())
+                },
+                uid,
+                gid,
+                username: if username.is_empty() {
+                    "spur".to_string()
+                } else {
+                    username
+                },
+                home_dir,
             };
 
             let image_path = crate::container::resolve_image(&spec.container_image)

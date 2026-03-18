@@ -108,6 +108,10 @@ message JobSpec {
   string container_workdir = 72;   // Workdir inside container
   string container_name = 73;      // Named container (persists across jobs)
   bool container_readonly = 74;    // Read-only rootfs
+  bool container_mount_home = 75;  // Bind-mount user home directory
+  map<string, string> container_env = 76; // Extra env vars for container
+  string container_entrypoint = 77; // Override entrypoint
+  bool container_remap_root = 78;  // Remap user to root inside container
 }
 
 message JobInfo {
