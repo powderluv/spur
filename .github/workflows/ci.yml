@@ -96,7 +96,7 @@ jobs:
           ~/spur/etc/stop-all.sh 2>/dev/null || true
           sleep 2
 
-      - name: Deploy fresh binaries
+      - name: Deploy fresh binaries and test scripts
         run: |
           cp target/release/spur target/release/spurctld target/release/spurd \
              target/release/spurdbd target/release/spurrestd ~/spur/bin/
@@ -104,6 +104,20 @@ jobs:
             target/release/spur \
             target/release/spurd \
             mi300-2:~/spur/bin/
+          # Keep test scripts in sync with the repo on both nodes
+          chmod +x deploy/bare-metal/inference_job.sh deploy/bare-metal/distributed_job.sh
+          rsync -a --checksum \
+            deploy/bare-metal/inference_test.py \
+            deploy/bare-metal/inference_job.sh \
+            deploy/bare-metal/distributed_test.py \
+            deploy/bare-metal/distributed_job.sh \
+            ~/spur/
+          rsync -a --checksum \
+            deploy/bare-metal/inference_test.py \
+            deploy/bare-metal/inference_job.sh \
+            deploy/bare-metal/distributed_test.py \
+            deploy/bare-metal/distributed_job.sh \
+            mi300-2:~/spur/
 
       - name: Start cluster
         run: |

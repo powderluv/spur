@@ -808,6 +808,72 @@ fi
 rm -f /tmp/spur-walltime-$$.out
 ssh mi300-2 "rm -f /tmp/spur-walltime-$$.out" 2>/dev/null || true
 echo ""
+sleep 2
+
+# --- Test 17: Distributed Inference (Tensor-Parallel, 8-way per node) ---
+echo "--- Distributed Inference (TP-8 on each MI300X node) ---"
+#
+# inference_test.py runs mp.spawn across all GPUs on the node.
+# Communication is intra-node RCCL (cross-node NCCL is firewalled on Vultr).
+# Spur dispatches the job to both nodes; each runs an independent TP group.
+# We verify both nodes complete and report throughput.
+#
+
+JI=$(${SPUR}/sbatch -J test-infer -N 2 \
+    -o /tmp/spur-infer-$$.out \
+    ~/spur/inference_job.sh 2>/dev/null | awk '{print $NF}')
+run_test "inference: 2-node job submitted" test -n "${JI}"
+
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: inference: both nodes complete within 3m ... "
+if wait_job "${JI}" 180; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (timeout)"
+    FAIL=$((FAIL + 1))
+fi
+
+LOCAL_INF=$(cat /tmp/spur-infer-$$.out 2>/dev/null || true)
+REMOTE_INF=$(remote_out "/tmp/spur-infer-$$.out")
+
+expect_output "inference: node0 INFERENCE_OK" "INFERENCE_OK" "/tmp/spur-infer-$$.out"
+
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: inference: mi300-2 INFERENCE_OK ... "
+if echo "${REMOTE_INF}" | grep -q "INFERENCE_OK"; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (remote: ${REMOTE_INF:-empty})"
+    FAIL=$((FAIL + 1))
+fi
+
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: inference: throughput reported on both nodes ... "
+LOCAL_TP=$(echo "${LOCAL_INF}" | grep -c "Throughput:" || true)
+REMOTE_TP=$(echo "${REMOTE_INF}" | grep -c "Throughput:" || true)
+if [ "${LOCAL_TP}" -ge 1 ] && [ "${REMOTE_TP}" -ge 1 ]; then
+    # Print the numbers so they're visible in CI logs
+    echo "PASS"
+    echo "    node0: $(echo "${LOCAL_INF}"  | grep Throughput:)"
+    echo "    node1: $(echo "${REMOTE_INF}" | grep Throughput:)"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (node0_count=${LOCAL_TP}, node1_count=${REMOTE_TP})"
+    FAIL=$((FAIL + 1))
+fi
+
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: inference: output finite (no NaN/Inf) ... "
+if ! echo "${LOCAL_INF}${REMOTE_INF}" | grep -qi "non-finite\|nan\|error"; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL"
+    FAIL=$((FAIL + 1))
+fi
+
+rm -f /tmp/spur-infer-$$.out
+ssh mi300-2 "rm -f /tmp/spur-infer-$$.out" 2>/dev/null || true
+echo ""
 
 # --- Summary ---
 echo "============================================"
