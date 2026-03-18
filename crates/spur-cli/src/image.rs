@@ -80,6 +80,39 @@ async fn cmd_import(image: &str) -> Result<()> {
     }
 
     // Fallback: skopeo + umoci + mksquashfs
+    // Check for required tools up front with clear error messages
+    fn check_tool(name: &str, install_hint: &str) -> Result<()> {
+        let found = std::process::Command::new("which")
+            .arg(name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !found {
+            anyhow::bail!(
+                "{} not found. {}\n\nAlternatively, install enroot for native Docker import:\n  \
+                 https://github.com/NVIDIA/enroot",
+                name,
+                install_hint
+            );
+        }
+        Ok(())
+    }
+
+    check_tool(
+        "skopeo",
+        "Install with:\n  sudo apt install skopeo    # Debian/Ubuntu\n  sudo dnf install skopeo    # Fedora/RHEL",
+    )?;
+    check_tool(
+        "umoci",
+        "Install with:\n  sudo apt install umoci     # Debian/Ubuntu\n  go install github.com/opencontainers/umoci/cmd/umoci@latest",
+    )?;
+    check_tool(
+        "mksquashfs",
+        "Install with:\n  sudo apt install squashfs-tools    # Debian/Ubuntu\n  sudo dnf install squashfs-tools    # Fedora/RHEL",
+    )?;
+
     let tmp_dir = format!("/var/spool/spur/containers/import_{}", name);
     let oci_dir = format!("{}/oci", tmp_dir);
     let rootfs_dir = format!("{}/rootfs", tmp_dir);
@@ -93,42 +126,45 @@ async fn cmd_import(image: &str) -> Result<()> {
     };
 
     eprintln!("Downloading with skopeo...");
-    let status = tokio::process::Command::new("skopeo")
+    let output = tokio::process::Command::new("skopeo")
         .args(["copy", &skopeo_src, &format!("oci:{}", oci_dir)])
-        .status()
+        .output()
         .await
-        .context("failed to run skopeo — install with: sudo apt install skopeo")?;
-    if !status.success() {
+        .context("failed to run skopeo")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        anyhow::bail!("skopeo copy failed");
+        anyhow::bail!("skopeo copy failed for '{}': {}", image, stderr.trim());
     }
 
     eprintln!("Extracting layers with umoci...");
-    let status = tokio::process::Command::new("umoci")
+    let output = tokio::process::Command::new("umoci")
         .args([
             "unpack",
             "--image",
             &format!("{}:latest", oci_dir),
             &rootfs_dir,
         ])
-        .status()
+        .output()
         .await
-        .context("failed to run umoci — install with: sudo apt install umoci")?;
-    if !status.success() {
+        .context("failed to run umoci")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        anyhow::bail!("umoci unpack failed");
+        anyhow::bail!("umoci unpack failed: {}", stderr.trim());
     }
 
     eprintln!("Creating squashfs...");
     let rootfs_content = format!("{}/rootfs", rootfs_dir);
-    let status = tokio::process::Command::new("mksquashfs")
+    let output = tokio::process::Command::new("mksquashfs")
         .args([&rootfs_content, &output_path, "-noappend", "-comp", "zstd"])
-        .status()
+        .output()
         .await
-        .context("failed to run mksquashfs — install with: sudo apt install squashfs-tools")?;
-    if !status.success() {
+        .context("failed to run mksquashfs")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        anyhow::bail!("mksquashfs failed");
+        anyhow::bail!("mksquashfs failed: {}", stderr.trim());
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

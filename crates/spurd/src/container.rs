@@ -95,7 +95,7 @@ pub fn setup_rootfs(image_path: &Path, job_id: u32, name: Option<&str>) -> anyho
         .with_context(|| format!("failed to create container rootfs at {}", rootfs.display()))?;
 
     // Extract squashfs to rootfs
-    let status = std::process::Command::new("unsquashfs")
+    let unsquashfs_result = std::process::Command::new("unsquashfs")
         .args([
             "-f", // force overwrite
             "-d", // destination
@@ -104,11 +104,29 @@ pub fn setup_rootfs(image_path: &Path, job_id: u32, name: Option<&str>) -> anyho
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .status()
-        .context("failed to run unsquashfs — is squashfs-tools installed?")?;
+        .output();
 
-    if !status.success() {
-        bail!("unsquashfs failed for image {}", image_path.display());
+    match unsquashfs_result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "unsquashfs failed for image {} (exit {}): {}",
+                image_path.display(),
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "unsquashfs not found. Install squashfs-tools:\n  \
+                 sudo apt install squashfs-tools    # Debian/Ubuntu\n  \
+                 sudo dnf install squashfs-tools    # Fedora/RHEL"
+            );
+        }
+        Err(e) => {
+            bail!("failed to run unsquashfs: {}", e);
+        }
     }
 
     info!(rootfs = %rootfs.display(), "container rootfs created");
@@ -407,38 +425,68 @@ pub async fn import_image(uri: &str) -> anyhow::Result<PathBuf> {
         format!("docker://{}", uri)
     };
 
-    info!(image = %uri, "downloading image with skopeo");
-    let status = Command::new("skopeo")
-        .args(["copy", &skopeo_src, &format!("oci:{}", oci_dir.display())])
-        .status()
-        .await
-        .context("failed to run skopeo — is skopeo installed?")?;
-    if !status.success() {
+    // Check that required tools are installed before starting
+    if !which("skopeo") {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!("skopeo copy failed for {}", uri);
+        bail!(
+            "skopeo not found. Install it to import OCI images:\n  \
+             sudo apt install skopeo    # Debian/Ubuntu\n  \
+             sudo dnf install skopeo    # Fedora/RHEL\n\
+             \nAlternatively, install enroot for native Docker import support."
+        );
+    }
+    if !which("umoci") {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!(
+            "umoci not found. Install it to extract OCI images:\n  \
+             sudo apt install umoci     # Debian/Ubuntu\n  \
+             go install github.com/opencontainers/umoci/cmd/umoci@latest\n\
+             \nAlternatively, install enroot for native Docker import support."
+        );
+    }
+    if !which("mksquashfs") {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!(
+            "mksquashfs not found. Install squashfs-tools:\n  \
+             sudo apt install squashfs-tools    # Debian/Ubuntu\n  \
+             sudo dnf install squashfs-tools    # Fedora/RHEL"
+        );
+    }
+
+    info!(image = %uri, "downloading image with skopeo");
+    let output = Command::new("skopeo")
+        .args(["copy", &skopeo_src, &format!("oci:{}", oci_dir.display())])
+        .output()
+        .await
+        .context("failed to run skopeo")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!("skopeo copy failed for '{}': {}", uri, stderr.trim());
     }
 
     // Extract OCI layers to rootfs using umoci
     info!("extracting OCI layers with umoci");
-    let status = Command::new("umoci")
+    let output = Command::new("umoci")
         .args([
             "unpack",
             "--image",
             &format!("{}:latest", oci_dir.display()),
             rootfs_dir.to_str().unwrap(),
         ])
-        .status()
+        .output()
         .await
-        .context("failed to run umoci — is umoci installed?")?;
-    if !status.success() {
+        .context("failed to run umoci")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!("umoci unpack failed");
+        bail!("umoci unpack failed: {}", stderr.trim());
     }
 
     // Pack rootfs into squashfs
     let rootfs_content = rootfs_dir.join("rootfs");
     info!("creating squashfs image");
-    let status = Command::new("mksquashfs")
+    let output = Command::new("mksquashfs")
         .args([
             rootfs_content.to_str().unwrap(),
             output_path.to_str().unwrap(),
@@ -446,12 +494,13 @@ pub async fn import_image(uri: &str) -> anyhow::Result<PathBuf> {
             "-comp",
             "zstd",
         ])
-        .status()
+        .output()
         .await
-        .context("failed to run mksquashfs — is squashfs-tools installed?")?;
-    if !status.success() {
+        .context("failed to run mksquashfs")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!("mksquashfs failed");
+        bail!("mksquashfs failed: {}", stderr.trim());
     }
 
     // Cleanup temp dir
@@ -523,32 +572,116 @@ fn which(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    // --- Mount parsing ---
+
     #[test]
-    fn test_parse_mount() {
+    fn test_parse_mount_basic() {
         let m = parse_mount("/data:/data").unwrap();
         assert_eq!(m.source, "/data");
         assert_eq!(m.target, "/data");
         assert!(!m.readonly);
+    }
 
+    #[test]
+    fn test_parse_mount_readonly() {
         let m = parse_mount("/src:/dst:ro").unwrap();
         assert_eq!(m.source, "/src");
         assert_eq!(m.target, "/dst");
         assert!(m.readonly);
-
-        assert!(parse_mount("/only-one-part").is_err());
     }
 
     #[test]
-    fn test_sanitize_name() {
+    fn test_parse_mount_rw_explicit() {
+        let m = parse_mount("/src:/dst:rw").unwrap();
+        assert!(!m.readonly);
+    }
+
+    #[test]
+    fn test_parse_mount_one_part_fails() {
+        let err = parse_mount("/only-one-part").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid mount spec"),
+            "expected 'invalid mount spec', got: {}",
+            err
+        );
+        assert!(err.to_string().contains("/src:/dst"));
+    }
+
+    #[test]
+    fn test_parse_mount_empty_fails() {
+        assert!(parse_mount("").is_err());
+    }
+
+    #[test]
+    fn test_parse_mount_too_many_parts_fails() {
+        let err = parse_mount("/a:/b:ro:extra:parts").unwrap_err();
+        assert!(err.to_string().contains("invalid mount spec"));
+    }
+
+    // --- Name sanitization ---
+
+    #[test]
+    fn test_sanitize_docker_uri() {
         assert_eq!(
             sanitize_name("docker://nvcr.io/nvidia/pytorch:24.01"),
             "nvcr.io+nvidia+pytorch+24.01"
         );
+    }
+
+    #[test]
+    fn test_sanitize_simple_name() {
         assert_eq!(sanitize_name("ubuntu:22.04"), "ubuntu+22.04");
     }
 
     #[test]
-    fn test_build_gpu_mounts() {
+    fn test_sanitize_nested_path() {
+        assert_eq!(
+            sanitize_name("registry.example.com/org/image:v1.2.3"),
+            "registry.example.com+org+image+v1.2.3"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_no_tag() {
+        assert_eq!(sanitize_name("alpine"), "alpine");
+    }
+
+    // --- Image resolution ---
+
+    #[test]
+    fn test_resolve_image_not_found() {
+        let err = resolve_image("nonexistent-image-xyz").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("spur image import"),
+            "should suggest 'spur image import', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_absolute_path_not_found() {
+        let err = resolve_image("/nonexistent/path/to/image.sqsh").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_resolve_image_docker_uri_not_imported() {
+        let err = resolve_image("docker://ubuntu:22.04").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"));
+        assert!(msg.contains("spur image import"));
+    }
+
+    // --- GPU mounts ---
+
+    #[test]
+    fn test_gpu_mounts_with_devices() {
         let config = ContainerConfig {
             image: "test".into(),
             mounts: vec![],
@@ -559,9 +692,153 @@ mod tests {
             environment: HashMap::new(),
         };
         let script = build_gpu_mounts(&config, "/tmp/rootfs");
+        // AMD devices
         assert!(script.contains("/dev/dri"));
         assert!(script.contains("/dev/kfd"));
+        assert!(script.contains("/opt/rocm"));
+        // NVIDIA devices
+        assert!(script.contains("/dev/nvidia"));
+        // Visibility env vars
         assert!(script.contains("ROCR_VISIBLE_DEVICES=0,1"));
         assert!(script.contains("CUDA_VISIBLE_DEVICES=0,1"));
+    }
+
+    #[test]
+    fn test_gpu_mounts_no_devices() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+        };
+        let script = build_gpu_mounts(&config, "/tmp/rootfs");
+        // Should still mount device dirs (if they exist on host)
+        assert!(script.contains("/dev/dri"));
+        // But no visibility env vars
+        assert!(!script.contains("ROCR_VISIBLE_DEVICES"));
+        assert!(!script.contains("CUDA_VISIBLE_DEVICES"));
+    }
+
+    // --- Container launch script ---
+
+    #[test]
+    fn test_launch_script_basic_structure() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 42).unwrap();
+
+        assert!(script.starts_with("#!/bin/bash"));
+        assert!(script.contains("set -e"));
+        // Copies inner script into rootfs
+        assert!(script.contains("/tmp/inner.sh"));
+        assert!(script.contains("spur_job_42.sh"));
+        // Has namespace/chroot logic
+        assert!(script.contains("unshare"));
+        assert!(script.contains("chroot"));
+        // Non-root fallback
+        assert!(script.contains("SPUR_CONTAINER_ROOTFS"));
+    }
+
+    #[test]
+    fn test_launch_script_with_workdir() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: Some("/workspace".into()),
+            name: None,
+            readonly: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        assert!(script.contains("cd /workspace"));
+    }
+
+    #[test]
+    fn test_launch_script_with_mounts() {
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![
+                BindMount {
+                    source: "/data".into(),
+                    target: "/mnt/data".into(),
+                    readonly: true,
+                },
+                BindMount {
+                    source: "/models".into(),
+                    target: "/models".into(),
+                    readonly: false,
+                },
+            ],
+            workdir: None,
+            name: None,
+            readonly: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        assert!(script.contains("mount --bind \"/data\""));
+        assert!(script.contains("/mnt/data"));
+        assert!(script.contains("remount,bind,ro"));
+        assert!(script.contains("mount --bind \"/models\""));
+    }
+
+    // --- Image removal ---
+
+    #[test]
+    fn test_remove_image_not_found() {
+        let err = remove_image("nonexistent-image-that-doesnt-exist").unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "expected 'not found', got: {}",
+            err
+        );
+    }
+
+    // --- List images (empty) ---
+
+    #[test]
+    fn test_list_images_nonexistent_dir() {
+        // Temporarily override — just test with a known empty path
+        // list_images uses a hardcoded path, so this tests the "dir doesn't exist" case
+        // by checking the function handles it gracefully
+        let images = list_images();
+        // May or may not have images depending on test env, but shouldn't panic
+        let _ = images;
+    }
+
+    // --- Cleanup ---
+
+    #[test]
+    fn test_cleanup_rootfs_nonexistent() {
+        // Should not panic when cleaning up a rootfs that doesn't exist
+        cleanup_rootfs(999999);
+    }
+
+    // --- Which ---
+
+    #[test]
+    fn test_which_finds_bash() {
+        assert!(which("bash"));
+    }
+
+    #[test]
+    fn test_which_not_found() {
+        assert!(!which("nonexistent-binary-that-doesnt-exist-xyz"));
     }
 }
