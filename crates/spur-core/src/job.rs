@@ -164,6 +164,13 @@ pub struct JobSpec {
     pub hold: bool,
     pub comment: Option<String>,
     pub wckey: Option<String>,
+
+    // Container
+    pub container_image: Option<String>,
+    pub container_mounts: Vec<String>,
+    pub container_workdir: Option<String>,
+    pub container_name: Option<String>,
+    pub container_readonly: bool,
 }
 
 impl Default for JobSpec {
@@ -202,6 +209,11 @@ impl Default for JobSpec {
             hold: false,
             comment: None,
             wckey: None,
+            container_image: None,
+            container_mounts: Vec::new(),
+            container_workdir: None,
+            container_name: None,
+            container_readonly: false,
         }
     }
 }

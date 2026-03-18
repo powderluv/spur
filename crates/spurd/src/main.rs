@@ -1,4 +1,5 @@
 mod agent_server;
+pub mod container;
 mod executor;
 mod gpu;
 mod reporter;

@@ -234,6 +234,11 @@ async fn dispatch_to_agent(
         hold: spec.hold,
         comment: spec.comment.clone().unwrap_or_default(),
         wckey: spec.wckey.clone().unwrap_or_default(),
+        container_image: spec.container_image.clone().unwrap_or_default(),
+        container_mounts: spec.container_mounts.clone(),
+        container_workdir: spec.container_workdir.clone().unwrap_or_default(),
+        container_name: spec.container_name.clone().unwrap_or_default(),
+        container_readonly: spec.container_readonly,
     };
 
     let response = client

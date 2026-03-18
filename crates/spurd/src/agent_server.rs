@@ -58,6 +58,8 @@ impl AgentService {
 
                 for (job_id, exit_code) in &completed {
                     jobs.remove(job_id);
+                    // Clean up unnamed container rootfs
+                    crate::container::cleanup_rootfs(*job_id);
                     // Report completion to controller
                     report_completion(&controller_addr, *job_id, *exit_code).await;
                 }
@@ -139,10 +141,64 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_PEER_NODES".into(), peer_nodes.join(","));
         }
 
+        // If container image is specified, wrap the job in a container
+        let (launch_script, is_container) = if !spec.container_image.is_empty() {
+            info!(job_id, image = %spec.container_image, "launching containerized job");
+
+            let mounts: Vec<crate::container::BindMount> = spec
+                .container_mounts
+                .iter()
+                .filter_map(|m| crate::container::parse_mount(m).ok())
+                .collect();
+
+            let container_config = crate::container::ContainerConfig {
+                image: spec.container_image.clone(),
+                mounts,
+                workdir: if spec.container_workdir.is_empty() {
+                    None
+                } else {
+                    Some(spec.container_workdir.clone())
+                },
+                name: if spec.container_name.is_empty() {
+                    None
+                } else {
+                    Some(spec.container_name.clone())
+                },
+                readonly: spec.container_readonly,
+                gpu_devices: vec![], // TODO: from GRES allocation
+                environment: env.clone(),
+            };
+
+            let image_path = crate::container::resolve_image(&spec.container_image)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+
+            let rootfs = crate::container::setup_rootfs(
+                &image_path,
+                job_id,
+                container_config.name.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
+
+            // Write the inner script to a temp file path
+            let inner_script_path = format!("{}/tmp/spur_job_{}.sh", work_dir, job_id);
+
+            let wrapper = crate::container::build_container_launch_script(
+                &container_config,
+                &rootfs,
+                &inner_script_path,
+                job_id,
+            )
+            .map_err(|e| Status::internal(format!("container script failed: {}", e)))?;
+
+            (wrapper, true)
+        } else {
+            (script, false)
+        };
+
         // Launch the job
         match executor::launch_job(
             job_id,
-            &script,
+            &launch_script,
             &work_dir,
             &env,
             &spec.stdout_path,

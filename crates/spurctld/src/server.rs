@@ -367,6 +367,23 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.wckey)
         },
+        container_image: if spec.container_image.is_empty() {
+            None
+        } else {
+            Some(spec.container_image)
+        },
+        container_mounts: spec.container_mounts,
+        container_workdir: if spec.container_workdir.is_empty() {
+            None
+        } else {
+            Some(spec.container_workdir)
+        },
+        container_name: if spec.container_name.is_empty() {
+            None
+        } else {
+            Some(spec.container_name)
+        },
+        container_readonly: spec.container_readonly,
     })
 }
 

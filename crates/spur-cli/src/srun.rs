@@ -64,6 +64,19 @@ pub struct SrunArgs {
     #[arg(short = 'l', long)]
     pub label: bool,
 
+    // Container
+    /// Container image (OCI ref or squashfs path)
+    #[arg(long)]
+    pub container_image: Option<String>,
+
+    /// Container bind mounts ("/src:/dst:ro")
+    #[arg(long)]
+    pub container_mounts: Vec<String>,
+
+    /// Working directory inside the container
+    #[arg(long)]
+    pub container_workdir: Option<String>,
+
     /// Controller address
     #[arg(
         long,
@@ -147,6 +160,9 @@ pub async fn main() -> Result<()> {
         work_dir: work_dir.clone(),
         environment,
         time_limit,
+        container_image: args.container_image.unwrap_or_default(),
+        container_mounts: args.container_mounts,
+        container_workdir: args.container_workdir.unwrap_or_default(),
         ..Default::default()
     };
 

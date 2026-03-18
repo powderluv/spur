@@ -101,6 +101,13 @@ message JobSpec {
   bool hold = 62;
   string comment = 63;
   string wckey = 64;
+
+  // Container
+  string container_image = 70;     // OCI image ref or squashfs path
+  repeated string container_mounts = 71;  // "/src:/dst:ro" bind mounts
+  string container_workdir = 72;   // Workdir inside container
+  string container_name = 73;      // Named container (persists across jobs)
+  bool container_readonly = 74;    // Read-only rootfs
 }
 
 message JobInfo {
