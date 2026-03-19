@@ -539,6 +539,7 @@ impl ClusterManager {
     }
 
     /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
+    /// Recomputes effective priority using age and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
         let jobs = self.jobs.read();
         let mut pending: Vec<Job> = jobs
@@ -571,6 +572,23 @@ impl ClusterManager {
                 }
             }
         });
+
+        // Recompute effective priority with age + partition tier
+        let now = Utc::now();
+        let partitions = self.partitions.read();
+        for job in &mut pending {
+            let age_minutes = (now - job.submit_time).num_minutes().max(0);
+            let partition_tier = job
+                .spec
+                .partition
+                .as_ref()
+                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
+                .map(|p| p.priority_tier)
+                .unwrap_or(1);
+            // fair_share = 1.0 (neutral) until spurdbd integration
+            job.priority =
+                spur_sched::priority::effective_priority(job.priority, 1.0, age_minutes, partition_tier);
+        }
 
         pending.sort_by(|a, b| b.priority.cmp(&a.priority));
         pending
