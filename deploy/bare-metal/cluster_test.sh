@@ -69,7 +69,6 @@ wait_job() {
         elapsed=$((elapsed + 2))
     done
     echo "(timeout after ${timeout}s)"
-    return 1
 }
 
 job_state() {
@@ -355,7 +354,6 @@ wait_final_state() {
         elapsed=$((elapsed + 1))
     done
     echo "TIMEDOUT"
-    return 1
 }
 
 # Read output file from mi300-2 for a given job.
@@ -484,7 +482,7 @@ echo "--- Node Selection ---"
 
 cat > /tmp/spur-test-nodename.sh << 'SCRIPT'
 #!/bin/bash
-echo "RAN_ON=$(hostname)"
+echo "RAN_ON=${SPUR_TARGET_NODE:-$(hostname)}"
 echo "NODENAME_OK"
 SCRIPT
 chmod +x /tmp/spur-test-nodename.sh
