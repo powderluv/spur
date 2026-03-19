@@ -341,13 +341,15 @@ pub async fn main() -> Result<()> {
         gres.push(format!("gpu:{}", gpn));
     }
 
-    // Parse time limit
+    // Parse time limit — use parse_time_seconds so that short values like
+    // "0:00:10" (10 seconds) are stored with full second precision instead of
+    // being rounded up to the nearest minute.
     let time_limit = args
         .time
         .as_ref()
-        .and_then(|t| spur_core::config::parse_time_minutes(t))
-        .map(|mins| prost_types::Duration {
-            seconds: mins as i64 * 60,
+        .and_then(|t| spur_core::config::parse_time_seconds(t))
+        .map(|secs| prost_types::Duration {
+            seconds: secs as i64,
             nanos: 0,
         });
 

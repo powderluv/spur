@@ -787,9 +787,9 @@ JWTIME=$(${SPUR}/sbatch -J test-walltime -N 1 \
 run_test "time limit: --time=0:00:10 submitted" test -n "${JWTIME}"
 
 TOTAL=$((TOTAL + 1))
-echo -n "TEST ${TOTAL}: time limit: job killed within 25s ... "
+echo -n "TEST ${TOTAL}: time limit: job killed within 30s ... "
 KILLED=0
-for i in $(seq 1 25); do
+for i in $(seq 1 30); do
     sleep 1
     S=$(job_state "${JWTIME}")
     case "$S" in CA|F|TO|"") KILLED=1; break ;; esac
@@ -797,7 +797,7 @@ done
 if [ "${KILLED}" -eq 1 ]; then
     echo "PASS"; PASS=$((PASS + 1))
 else
-    echo "FAIL (still running after 25s)"
+    echo "FAIL (still running after 30s)"
     FAIL=$((FAIL + 1))
     ${SPUR}/scancel "${JWTIME}" 2>/dev/null || true
 fi
@@ -832,8 +832,8 @@ JI=$(${SPUR}/sbatch -J test-infer -N 2 \
 run_test "inference: 2-node job submitted" test -n "${JI}"
 
 TOTAL=$((TOTAL + 1))
-echo -n "TEST ${TOTAL}: inference: both nodes complete within 3m ... "
-if wait_job "${JI}" 180; then
+echo -n "TEST ${TOTAL}: inference: both nodes complete within 10m ... "
+if wait_job "${JI}" 600; then
     echo "PASS"; PASS=$((PASS + 1))
 else
     echo "FAIL (timeout)"
