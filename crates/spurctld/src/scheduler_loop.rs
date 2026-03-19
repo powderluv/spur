@@ -8,7 +8,7 @@ use spur_proto::proto::{
     AgentCancelJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
     ResourceSet as ProtoResourceSet,
 };
-use spur_sched::backfill::BackfillScheduler;
+use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
@@ -75,16 +75,18 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 None => continue,
             };
 
-            let per_node_cpus = if let Some(tpn) = job.spec.tasks_per_node {
-                tpn * job.spec.cpus_per_task
-            } else {
-                (job.spec.num_tasks / job.spec.num_nodes.max(1)) * job.spec.cpus_per_task
-            };
-
+            // Compute per-node resources (including GPUs from GRES)
+            let per_node = backfill::job_resource_request(&job);
+            let node_count = assignment.nodes.len() as u32;
             let resources = spur_core::resource::ResourceSet {
-                cpus: per_node_cpus * assignment.nodes.len() as u32,
-                memory_mb: job.spec.memory_per_node_mb.unwrap_or(0) * assignment.nodes.len() as u64,
-                ..Default::default()
+                cpus: per_node.cpus * node_count,
+                memory_mb: per_node.memory_mb * node_count as u64,
+                gpus: per_node.gpus.clone(),
+                generic: per_node
+                    .generic
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v * node_count as u64))
+                    .collect(),
             };
 
             // Transition job to Running

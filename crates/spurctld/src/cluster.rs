@@ -234,6 +234,22 @@ impl ClusterManager {
         job.allocated_resources = Some(resources.clone());
         job.pending_reason = PendingReason::None;
 
+        // Compute per-node resource share
+        let node_count = node_names.len().max(1) as u32;
+        let per_node = ResourceSet {
+            cpus: resources.cpus / node_count,
+            memory_mb: resources.memory_mb / node_count as u64,
+            gpus: resources.gpus.clone(), // GPUs are already per-node in the request
+            generic: resources
+                .generic
+                .iter()
+                .map(|(k, v)| (k.clone(), v / node_count as u64))
+                .collect(),
+        };
+
+        // Drop jobs lock before acquiring nodes lock (lock ordering: jobs → nodes)
+        drop(jobs);
+
         self.append_wal(WalOperation::JobStateChange {
             job_id,
             old_state,
@@ -241,9 +257,18 @@ impl ClusterManager {
         });
         self.append_wal(WalOperation::JobStart {
             job_id,
-            nodes: node_names,
+            nodes: node_names.clone(),
             resources,
         });
+
+        // Update node alloc_resources
+        let mut nodes = self.nodes.write();
+        for name in &node_names {
+            if let Some(node) = nodes.get_mut(name) {
+                node.alloc_resources = node.alloc_resources.add(&per_node);
+                node.update_state_from_alloc();
+            }
+        }
 
         debug!(job_id, "job started");
         Ok(())
@@ -261,12 +286,12 @@ impl ClusterManager {
             .get_mut(&job_id)
             .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
 
-        let old_state = job.state;
         job.transition(state)?;
         job.exit_code = Some(exit_code);
 
-        // Free node allocations
+        // Capture allocation info before dropping jobs lock
         let freed_nodes = job.allocated_nodes.clone();
+        let allocated_resources = job.allocated_resources.clone();
         drop(jobs);
 
         self.append_wal(WalOperation::JobComplete {
@@ -275,12 +300,33 @@ impl ClusterManager {
             state,
         });
 
-        // Update node states
+        // Subtract per-node resources instead of blanket-zeroing
         let mut nodes = self.nodes.write();
-        for name in &freed_nodes {
-            if let Some(node) = nodes.get_mut(name) {
-                node.alloc_resources = ResourceSet::default();
-                node.update_state_from_alloc();
+        if let Some(ref total_resources) = allocated_resources {
+            let node_count = freed_nodes.len().max(1) as u32;
+            let per_node = ResourceSet {
+                cpus: total_resources.cpus / node_count,
+                memory_mb: total_resources.memory_mb / node_count as u64,
+                gpus: total_resources.gpus.clone(),
+                generic: total_resources
+                    .generic
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v / node_count as u64))
+                    .collect(),
+            };
+            for name in &freed_nodes {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.alloc_resources = node.alloc_resources.subtract(&per_node);
+                    node.update_state_from_alloc();
+                }
+            }
+        } else {
+            // Fallback: zero out (legacy jobs without tracked resources)
+            for name in &freed_nodes {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.alloc_resources = ResourceSet::default();
+                    node.update_state_from_alloc();
+                }
             }
         }
 

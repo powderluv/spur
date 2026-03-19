@@ -191,7 +191,7 @@ impl Scheduler for BackfillScheduler {
 }
 
 /// Extract the per-node resource request from a job spec.
-fn job_resource_request(job: &Job) -> ResourceSet {
+pub fn job_resource_request(job: &Job) -> ResourceSet {
     let cpus = if job.spec.tasks_per_node.is_some() {
         job.spec.tasks_per_node.unwrap_or(1) * job.spec.cpus_per_task
     } else {
