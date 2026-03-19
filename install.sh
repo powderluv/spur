@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Spur — Slurm-compatible HPC job scheduler
+# Install Spur — AI-native job scheduler
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash

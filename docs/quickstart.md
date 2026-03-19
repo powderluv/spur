@@ -458,4 +458,4 @@ spur show node gpu-node-1
 - **Accounting:** Start `spurdbd` with PostgreSQL for job history and fair-share scheduling
 - **REST API:** Start `spurrestd` for HTTP access (Slurm-compatible `/slurm/v0.0.42/` endpoints)
 - **Prolog/Epilog:** Set `SPUR_PROLOG` / `SPUR_EPILOG` environment variables to run scripts before/after jobs
-- **Kubernetes:** K8s integration is planned for hybrid HPC+cloud scheduling
+- **Kubernetes:** K8s integration is planned for hybrid cloud+on-prem scheduling
