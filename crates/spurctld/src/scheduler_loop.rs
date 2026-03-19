@@ -139,8 +139,6 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let peer_addrs = peer_addrs.clone();
                 let task_offset = node_idx as u32 * tasks_per_node;
                 let target_node = node_name.clone();
-                let cluster_for_dispatch = cluster.clone();
-
                 tokio::spawn(async move {
                     if let Err(e) = dispatch_to_agent(
                         &agent_addr,
@@ -152,16 +150,16 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                     )
                     .await
                     {
+                        // Log but do NOT mark job as Failed — that breaks afterok
+                        // dependencies. The job stays Running; the time-limit
+                        // enforcer will eventually clean it up if it has a
+                        // --time set. Agent completion reporting handles the
+                        // normal path.
                         error!(
                             job_id,
                             agent = %agent_addr,
                             error = %e,
-                            "failed to dispatch job to agent — marking job failed"
-                        );
-                        let _ = cluster_for_dispatch.complete_job(
-                            job_id,
-                            -1,
-                            spur_core::job::JobState::Failed,
+                            "failed to dispatch job to agent"
                         );
                     }
                 });

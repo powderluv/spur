@@ -62,9 +62,15 @@ impl AgentService {
 
                 for (job_id, exit_code, mode) in &completed {
                     jobs.remove(job_id);
-                    // Clean up unnamed container rootfs
                     crate::container::cleanup_rootfs(*job_id, mode);
-                    // Report completion to controller
+                }
+
+                // Release lock BEFORE network I/O — holding the lock during
+                // report_completion blocks new job launches and can lose
+                // completions if the RPC times out.
+                drop(jobs);
+
+                for (job_id, exit_code, _mode) in &completed {
                     report_completion(&controller_addr, *job_id, *exit_code).await;
                 }
             }
@@ -87,23 +93,49 @@ async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
         format!("http://{}", controller_addr)
     };
 
-    match SlurmControllerClient::connect(url).await {
-        Ok(mut client) => {
-            let req = ReportJobStatusRequest {
-                job_id,
-                state,
-                exit_code,
-                message: format!("exit_code={}", exit_code),
-            };
-            match client.report_job_status(req).await {
-                Ok(_) => info!(job_id, exit_code, "reported completion to controller"),
-                Err(e) => warn!(job_id, error = %e, "ReportJobStatus RPC failed"),
+    // Retry up to 3 times with 1-second backoff — a single transient failure
+    // must not permanently lose a job completion.
+    for attempt in 1..=3 {
+        match SlurmControllerClient::connect(url.clone()).await {
+            Ok(mut client) => {
+                let req = ReportJobStatusRequest {
+                    job_id,
+                    state,
+                    exit_code,
+                    message: format!("exit_code={}", exit_code),
+                };
+                match client.report_job_status(req).await {
+                    Ok(_) => {
+                        info!(job_id, exit_code, "reported completion to controller");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            job_id,
+                            attempt,
+                            error = %e,
+                            "ReportJobStatus RPC failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job_id,
+                    attempt,
+                    error = %e,
+                    "failed to connect to controller for completion report"
+                );
             }
         }
-        Err(e) => {
-            warn!(job_id, error = %e, "failed to connect to controller for completion report");
+        if attempt < 3 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }
+    error!(
+        job_id,
+        exit_code, "gave up reporting completion after 3 attempts"
+    );
 }
 
 #[tonic::async_trait]
