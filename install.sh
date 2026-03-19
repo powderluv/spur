@@ -4,10 +4,13 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash
 #
-#   # Or install a specific version:
+#   # Install nightly:
+#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- nightly
+#
+#   # Install a specific version:
 #   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- v0.1.0
 #
-#   # Or install to a custom directory:
+#   # Install to a custom directory:
 #   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | INSTALL_DIR=/opt/spur/bin bash
 
 set -euo pipefail
@@ -35,12 +38,20 @@ fi
 log "Installing Spur ${VERSION}"
 
 # --- Download ---
-TARBALL="spur-${VERSION}-linux-amd64.tar.gz"
-URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "${TMPDIR}"' EXIT
 
-log "Downloading ${URL}..."
+if [ "$VERSION" = "nightly" ]; then
+    # Nightly tarballs include date+sha in the name — find the .tar.gz asset
+    TARBALL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/nightly" \
+        | grep '"name"' | grep '\.tar\.gz"' | grep -v sha256 | head -1 | cut -d'"' -f4) \
+        || err "Could not find nightly release assets"
+else
+    TARBALL="spur-${VERSION}-linux-amd64.tar.gz"
+fi
+
+URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
+log "Downloading ${TARBALL}..."
 curl -fSL -o "${TMPDIR}/${TARBALL}" "${URL}" \
     || err "Download failed. Check that release ${VERSION} exists at https://github.com/${REPO}/releases"
 
@@ -57,7 +68,9 @@ tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 # --- Install ---
 mkdir -p "${INSTALL_DIR}"
-EXTRACTED="${TMPDIR}/spur-${VERSION}-linux-amd64"
+# Find the extracted directory (name varies for nightly)
+EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
+[ -n "${EXTRACTED}" ] || err "Could not find extracted directory"
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/spur" "${INSTALL_DIR}/spurctld" "${INSTALL_DIR}/spurd" \
          "${INSTALL_DIR}/spurdbd" "${INSTALL_DIR}/spurrestd"

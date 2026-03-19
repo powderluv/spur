@@ -1,0 +1,110 @@
+name: Nightly
+
+on:
+  schedule:
+    # 06:00 UTC every day
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    name: Build and publish nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nightly-
+
+      - name: Check for changes since last nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST=$(gh release view nightly --json createdAt --jq .createdAt 2>/dev/null || echo "1970-01-01T00:00:00Z")
+          COMMITS=$(git log --since="${LAST}" --oneline | wc -l)
+          echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
+          if [ "${COMMITS}" -eq 0 ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No new commits since last nightly — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${COMMITS} new commit(s) since last nightly"
+          fi
+
+      - name: Build release
+        if: steps.check.outputs.skip != 'true'
+        run: cargo build --release
+
+      - name: Package binaries
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DIST="spur-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
+
+          mkdir -p "${DIST}/bin"
+          for bin in spur spurctld spurd spurdbd spurrestd; do
+            cp "target/release/${bin}" "${DIST}/bin/"
+          done
+
+          cd "${DIST}/bin"
+          for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do
+            ln -s spur "${cmd}"
+          done
+          cd ../..
+
+          mkdir -p "${DIST}/etc"
+          cp deploy/bare-metal/spur.conf "${DIST}/etc/spur.conf.example"
+
+          tar czf "${DIST}.tar.gz" "${DIST}"
+          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+
+          echo "DIST=${DIST}" >> "$GITHUB_ENV"
+          echo "DATE=${DATE}" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Update nightly release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete existing nightly release + tag
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+
+          # Create fresh nightly release
+          gh release create nightly \
+            --title "Spur nightly (${DATE} · ${SHORT_SHA})" \
+            --notes "$(cat <<EOF
+          **Automated nightly build** from \`main\` at $(date -u +"%Y-%m-%d %H:%M UTC").
+
+          Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))
+
+          ${{ steps.check.outputs.commits }} commit(s) since previous nightly.
+
+          ### Install
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash -s -- nightly
+          \`\`\`
+          EOF
+          )" \
+            --prerelease \
+            spur-*.tar.gz spur-*.tar.gz.sha256
