@@ -119,6 +119,20 @@ pub async fn launch_job(
     // Set up cgroup for isolation
     let cgroup_path = setup_cgroup(job_id, cpus, memory_mb)?;
 
+    // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
+    // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
+    // the job can still run; absolute output paths in the spec are unaffected.
+    let effective_work_dir: String = if tokio::fs::create_dir_all(work_dir).await.is_ok() {
+        work_dir.to_string()
+    } else {
+        warn!(
+            job_id,
+            work_dir, "work_dir unavailable on this node, using /tmp"
+        );
+        "/tmp".to_string()
+    };
+    let work_dir = effective_work_dir.as_str();
+
     // Write script to temp file
     let script_path = PathBuf::from(work_dir).join(format!(".spur_job_{}.sh", job_id));
     tokio::fs::write(&script_path, script)

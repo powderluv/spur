@@ -422,6 +422,64 @@ pub fn parse_time_minutes(s: &str) -> Option<u32> {
     }
 }
 
+/// Parse a time string to total seconds (not minutes).
+///
+/// Same Slurm-compatible format as `parse_time_minutes` but with second
+/// granularity: "N" → N minutes, "H:MM" → hours+minutes, "H:MM:SS" → exact.
+pub fn parse_time_seconds(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("INFINITE") || s.eq_ignore_ascii_case("UNLIMITED") {
+        return None;
+    }
+
+    // days-hours:minutes:seconds
+    if let Some((days, rest)) = s.split_once('-') {
+        let days: u64 = days.parse().ok()?;
+        return Some(days * 86400 + parse_hms_seconds(rest)?);
+    }
+
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        1 => {
+            // Just minutes → convert to seconds
+            let mins: u64 = parts[0].parse().ok()?;
+            Some(mins * 60)
+        }
+        2 => {
+            // HH:MM → hours and minutes (no seconds)
+            let h: u64 = parts[0].parse().ok()?;
+            let m: u64 = parts[1].parse().ok()?;
+            Some(h * 3600 + m * 60)
+        }
+        3 => {
+            // HH:MM:SS
+            let h: u64 = parts[0].parse().ok()?;
+            let m: u64 = parts[1].parse().ok()?;
+            let sec: u64 = parts[2].parse().ok()?;
+            Some(h * 3600 + m * 60 + sec)
+        }
+        _ => None,
+    }
+}
+
+fn parse_hms_seconds(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        2 => {
+            let h: u64 = parts[0].parse().ok()?;
+            let m: u64 = parts[1].parse().ok()?;
+            Some(h * 3600 + m * 60)
+        }
+        3 => {
+            let h: u64 = parts[0].parse().ok()?;
+            let m: u64 = parts[1].parse().ok()?;
+            let sec: u64 = parts[2].parse().ok()?;
+            Some(h * 3600 + m * 60 + sec)
+        }
+        _ => None,
+    }
+}
+
 fn parse_hms(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 3 && parts.len() != 2 {
@@ -465,6 +523,25 @@ mod tests {
         assert_eq!(parse_time_minutes("72:00:00"), Some(4320));
         assert_eq!(parse_time_minutes("1-00:00:00"), Some(1440));
         assert_eq!(parse_time_minutes("INFINITE"), None);
+    }
+
+    #[test]
+    fn test_parse_time_seconds() {
+        // "N" → N minutes in seconds
+        assert_eq!(parse_time_seconds("1"), Some(60));
+        assert_eq!(parse_time_seconds("60"), Some(3600));
+        // "H:MM" → exact seconds
+        assert_eq!(parse_time_seconds("1:30"), Some(5400)); // 1h30m
+                                                            // "H:MM:SS" → exact seconds (the key case)
+        assert_eq!(parse_time_seconds("0:00:10"), Some(10));
+        assert_eq!(parse_time_seconds("0:01:30"), Some(90));
+        assert_eq!(parse_time_seconds("1:00:00"), Some(3600));
+        // days-HH:MM:SS
+        assert_eq!(parse_time_seconds("1-00:00:00"), Some(86400));
+        assert_eq!(parse_time_seconds("7-00:00:00"), Some(604800));
+        // limits
+        assert_eq!(parse_time_seconds("INFINITE"), None);
+        assert_eq!(parse_time_seconds("UNLIMITED"), None);
     }
 
     #[test]

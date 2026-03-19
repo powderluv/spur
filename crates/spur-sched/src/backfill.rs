@@ -49,10 +49,35 @@ impl BackfillScheduler {
         let partition_name = job.spec.partition.as_deref();
         let required = job_resource_request(job);
 
+        // Parse nodelist / exclude constraints once, outside the per-node loop.
+        let nodelist: Option<Vec<&str>> = job
+            .spec
+            .nodelist
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(str::trim).collect());
+
+        let exclude: Vec<&str> = job
+            .spec
+            .exclude
+            .as_deref()
+            .map(|s| s.split(',').map(str::trim).collect())
+            .unwrap_or_default();
+
         nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| {
+                // Honour --nodelist: node must be in the explicit allow-list.
+                if let Some(ref allowed) = nodelist {
+                    if !allowed.contains(&node.name.as_str()) {
+                        return false;
+                    }
+                }
+                // Honour --exclude: node must not be in the deny-list.
+                if exclude.contains(&node.name.as_str()) {
+                    return false;
+                }
                 // Check partition membership
                 if let Some(pname) = partition_name {
                     if !node.partitions.contains(&pname.to_string()) {
@@ -308,6 +333,135 @@ mod tests {
 
         // Request 4 nodes but only 2 available
         let pending = vec![make_job(1, 4, 32)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 0);
+    }
+
+    fn make_job_with_nodelist(
+        id: u32,
+        nodes: u32,
+        nodelist: Option<&str>,
+        exclude: Option<&str>,
+    ) -> Job {
+        let mut spec = JobSpec {
+            name: format!("job{}", id),
+            partition: Some("default".into()),
+            user: "test".into(),
+            num_nodes: nodes,
+            num_tasks: nodes,
+            cpus_per_task: 1,
+            time_limit: Some(Duration::hours(1)),
+            ..Default::default()
+        };
+        if let Some(nl) = nodelist {
+            spec.nodelist = Some(nl.into());
+        }
+        if let Some(ex) = exclude {
+            spec.exclude = Some(ex.into());
+        }
+        Job::new(id, spec)
+    }
+
+    #[test]
+    fn test_nodelist_pins_to_allowed_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4); // node001, node002, node003, node004
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 1, Some("node001"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes, vec!["node001"]);
+    }
+
+    #[test]
+    fn test_nodelist_multi_node() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 2, Some("node001,node002"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 2);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(assignments[0].nodes.contains(&"node002".to_string()));
+    }
+
+    #[test]
+    fn test_nodelist_no_match_returns_empty() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // "nodeXXX" does not exist in the cluster
+        let pending = vec![make_job_with_nodelist(1, 1, Some("nodeXXX"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 0);
+    }
+
+    #[test]
+    fn test_exclude_removes_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // Exclude node001 and node002 → only node003 and node004 remain
+        let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert!(!assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(!assignments[0].nodes.contains(&"node002".to_string()));
+    }
+
+    #[test]
+    fn test_exclude_too_many_leaves_unschedulable() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2); // node001, node002
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // Exclude both → 2-node job can't schedule
+        let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,

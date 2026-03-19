@@ -134,6 +134,10 @@ impl SlurmController for ControllerService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
         let name = request.into_inner().name;
+        // spurd uses GetNode as a lightweight heartbeat — update the
+        // last_heartbeat timestamp so the health checker doesn't mark
+        // the node DOWN.
+        self.cluster.update_heartbeat(&name, 0, 0);
         let node = self
             .cluster
             .get_node(&name)

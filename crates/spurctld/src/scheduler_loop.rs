@@ -1,18 +1,24 @@
 use std::sync::Arc;
 
+use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::{
-    JobSpec as ProtoJobSpec, LaunchJobRequest, ResourceSet as ProtoResourceSet,
+    AgentCancelJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
+    ResourceSet as ProtoResourceSet,
 };
 use spur_sched::backfill::BackfillScheduler;
 use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
 
-/// Main scheduler loop. Runs periodically, matching pending jobs to available nodes.
+/// Spawn the time-limit enforcement watchdog alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>) {
+    let enforcer_cluster = cluster.clone();
+    tokio::spawn(async move {
+        enforce_time_limits(enforcer_cluster).await;
+    });
     let interval_secs = cluster.config.scheduler.interval_secs.max(1) as u64;
     let max_jobs = cluster.config.scheduler.max_jobs_per_cycle as usize;
 
@@ -133,7 +139,6 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let peer_addrs = peer_addrs.clone();
                 let task_offset = node_idx as u32 * tasks_per_node;
                 let target_node = node_name.clone();
-
                 tokio::spawn(async move {
                     if let Err(e) = dispatch_to_agent(
                         &agent_addr,
@@ -145,6 +150,11 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                     )
                     .await
                     {
+                        // Log but do NOT mark job as Failed — that breaks afterok
+                        // dependencies. The job stays Running; the time-limit
+                        // enforcer will eventually clean it up if it has a
+                        // --time set. Agent completion reporting handles the
+                        // normal path.
                         error!(
                             job_id,
                             agent = %agent_addr,
@@ -272,4 +282,91 @@ async fn dispatch_to_agent(
     }
 
     Ok(())
+}
+
+/// Watchdog: cancel running jobs that have exceeded their wall-clock time limit.
+///
+/// Runs every 10 seconds.  For each running job with a `time_limit` whose
+/// `start_time + time_limit < now`, we:
+///   1. Mark the job as Timeout in the cluster state.
+///   2. Send `CancelJob` to every agent that holds a pod/process for the job.
+async fn enforce_time_limits(cluster: Arc<ClusterManager>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+
+        let now = Utc::now();
+        let running = cluster.get_jobs(&[spur_core::job::JobState::Running], None, None, None, &[]);
+
+        for job in running {
+            let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
+                continue;
+            };
+            let deadline = start_time + time_limit;
+            if now < deadline {
+                continue;
+            }
+
+            info!(
+                job_id = job.job_id,
+                elapsed_secs = (now - start_time).num_seconds(),
+                limit_secs = time_limit.num_seconds(),
+                "time limit exceeded — killing job"
+            );
+
+            // Mark as timed-out in the cluster state first so the scheduler
+            // can reuse the resources immediately.
+            if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
+            {
+                warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
+                continue;
+            }
+
+            // Send CancelJob to every allocated node's agent.
+            for node_name in &job.allocated_nodes {
+                let node_info = cluster.get_node(node_name);
+                let (addr, port) = match node_info {
+                    Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+                    _ => {
+                        warn!(
+                            job_id = job.job_id,
+                            node = %node_name,
+                            "no agent address — cannot cancel timed-out job on node"
+                        );
+                        continue;
+                    }
+                };
+
+                let agent_addr = format!("http://{}:{}", addr, port);
+                let job_id = job.job_id;
+                tokio::spawn(async move {
+                    match SlurmAgentClient::connect(agent_addr.clone()).await {
+                        Ok(mut client) => {
+                            if let Err(e) = client
+                                .cancel_job(AgentCancelJobRequest { job_id, signal: 0 })
+                                .await
+                            {
+                                warn!(
+                                    job_id,
+                                    agent = %agent_addr,
+                                    error = %e,
+                                    "CancelJob RPC failed for timed-out job"
+                                );
+                            } else {
+                                info!(job_id, agent = %agent_addr, "sent CancelJob for timed-out job");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                job_id,
+                                agent = %agent_addr,
+                                error = %e,
+                                "failed to connect to agent for timed-out job"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
 }
