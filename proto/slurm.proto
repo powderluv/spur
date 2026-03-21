@@ -91,6 +91,7 @@ message JobSpec {
   repeated string dependency = 43;  // "afterok:123,afterany:456"
   string nodelist = 44;             // "node[001-010]"
   string exclude = 45;
+  string constraint = 46;       // "mi300x,nvlink" - required node features
 
   // Array
   string array_spec = 50;  // "0-99%10"

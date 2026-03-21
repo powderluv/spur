@@ -92,6 +92,10 @@ pub struct SbatchArgs {
     #[arg(short = 'x', long)]
     pub exclude: Option<String>,
 
+    /// Required node features (e.g., "mi300x,nvlink")
+    #[arg(short = 'C', long)]
+    pub constraint: Option<String>,
+
     /// Job array (e.g., "0-99%10")
     #[arg(short = 'a', long)]
     pub array: Option<String>,
@@ -409,6 +413,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         dependency: dependencies,
         nodelist: args.nodelist.unwrap_or_default(),
         exclude: args.exclude.unwrap_or_default(),
+        constraint: args.constraint.unwrap_or_default(),
         array_spec: args.array.unwrap_or_default(),
         requeue: args.requeue,
         exclusive: args.exclusive,

@@ -373,7 +373,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.exclude)
         },
-        constraint: None, // TODO: wire from proto when --constraint is added to CLI
+        constraint: if spec.constraint.is_empty() {
+            None
+        } else {
+            Some(spec.constraint.clone())
+        },
         array_spec: if spec.array_spec.is_empty() {
             None
         } else {

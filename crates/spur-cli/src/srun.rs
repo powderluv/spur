@@ -65,6 +65,10 @@ pub struct SrunArgs {
     #[arg(long)]
     pub gpu_bind: Option<String>,
 
+    /// Required node features (e.g., "mi300x,nvlink")
+    #[arg(short = 'C', long)]
+    pub constraint: Option<String>,
+
     /// Job step label output
     #[arg(short = 'l', long)]
     pub label: bool,
@@ -181,6 +185,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         work_dir: work_dir.clone(),
         environment,
         time_limit,
+        constraint: args.constraint.unwrap_or_default(),
         container_image: args.container_image.unwrap_or_default(),
         container_mounts: args.container_mounts,
         container_workdir: args.container_workdir.unwrap_or_default(),
