@@ -228,6 +228,7 @@ impl ClusterManager {
             .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
 
         let old_state = job.state;
+        let exclusive = job.spec.exclusive;
         job.transition(JobState::Running)?;
         job.start_time = Some(Utc::now());
         job.allocated_nodes = node_names.clone();
@@ -265,7 +266,12 @@ impl ClusterManager {
         let mut nodes = self.nodes.write();
         for name in &node_names {
             if let Some(node) = nodes.get_mut(name) {
-                node.alloc_resources = node.alloc_resources.add(&per_node);
+                if exclusive {
+                    // Exclusive: claim entire node so no other jobs can co-schedule
+                    node.alloc_resources = node.total_resources.clone();
+                } else {
+                    node.alloc_resources = node.alloc_resources.add(&per_node);
+                }
                 node.update_state_from_alloc();
             }
         }

@@ -88,6 +88,18 @@ impl BackfillScheduler {
                 if !node.is_schedulable() {
                     return false;
                 }
+                // Exclusive job needs an idle node (no current allocations)
+                if job.spec.exclusive
+                    && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
+                {
+                    return false;
+                }
+                // Skip nodes fully consumed by an exclusive job
+                if node.alloc_resources.cpus >= node.total_resources.cpus
+                    && node.total_resources.cpus > 0
+                {
+                    return false;
+                }
                 // Check resource capacity (total, not current available)
                 node.total_resources.can_satisfy(&required)
             })
