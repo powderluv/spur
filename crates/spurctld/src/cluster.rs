@@ -6,10 +6,12 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
 use spur_core::node::{Node, NodeSource, NodeState};
 use spur_core::partition::Partition;
+use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::resource::ResourceSet;
 use spur_core::wal::{WalEntry, WalOperation, WalStore};
 use spur_state::snapshot::SnapshotStore;
@@ -399,6 +401,16 @@ impl ClusterManager {
                 if let Some(node) = nodes.get_mut(name) {
                     node.alloc_resources = node.alloc_resources.subtract(&per_node);
                     node.update_state_from_alloc();
+
+                    // Draining → Drain: if node was draining and all resources are now free,
+                    // complete the drain transition.
+                    if node.state == NodeState::Draining
+                        && node.alloc_resources.cpus == 0
+                        && node.alloc_resources.gpus.is_empty()
+                    {
+                        node.state = NodeState::Drain;
+                        info!(node = %node.name, "draining node fully drained");
+                    }
                 }
             }
         } else {
@@ -407,6 +419,12 @@ impl ClusterManager {
                 if let Some(node) = nodes.get_mut(name) {
                     node.alloc_resources = ResourceSet::default();
                     node.update_state_from_alloc();
+
+                    // Draining → Drain on fallback path too
+                    if node.state == NodeState::Draining {
+                        node.state = NodeState::Drain;
+                        info!(node = %node.name, "draining node fully drained");
+                    }
                 }
             }
         }
@@ -492,6 +510,16 @@ impl ClusterManager {
             if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
                 if hosts.contains(&name) {
                     node.partitions.push(part.name.clone());
+                }
+            }
+        }
+
+        // Copy features from node config
+        for nc in &self.config.nodes {
+            if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
+                if hosts.contains(&name) {
+                    node.features = nc.features.clone();
+                    break;
                 }
             }
         }
@@ -583,6 +611,8 @@ impl ClusterManager {
         priority: Option<u32>,
         partition: Option<String>,
         comment: Option<String>,
+        account: Option<String>,
+        qos: Option<String>,
     ) -> anyhow::Result<()> {
         let mut jobs = self.jobs.write();
         let job = jobs
@@ -607,11 +637,21 @@ impl ClusterManager {
         if let Some(c) = comment {
             job.spec.comment = Some(c);
         }
+        if let Some(a) = account {
+            job.spec.account = Some(a);
+        }
+        if let Some(q) = qos {
+            job.spec.qos = Some(q);
+        }
         info!(job_id, "job updated");
         Ok(())
     }
 
     /// Update node state (admin: drain, resume, etc.)
+    ///
+    /// When draining a node that still has running jobs, the state is set to
+    /// `Draining` instead of `Drain`. Once all jobs complete (tracked in
+    /// `complete_job`), the node transitions to `Drain`.
     pub fn update_node_state(
         &self,
         name: &str,
@@ -623,15 +663,25 @@ impl ClusterManager {
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
         let old_state = node.state;
-        node.state = state;
+
+        // If admin requests Drain but node has running jobs, set Draining instead
+        let effective_state = if state == NodeState::Drain
+            && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
+        {
+            NodeState::Draining
+        } else {
+            state
+        };
+
+        node.state = effective_state;
         node.state_reason = reason.clone();
         self.append_wal(WalOperation::NodeStateChange {
             name: name.to_string(),
             old_state,
-            new_state: state,
+            new_state: effective_state,
             reason,
         });
-        info!(node = %name, old = ?old_state, new = ?state, "node state updated");
+        info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
 
@@ -721,6 +771,47 @@ impl ClusterManager {
                 }
             }
             true
+        });
+
+        // QoS enforcement: check per-user limits for jobs with a QoS
+        pending.retain(|job| {
+            if job.spec.qos.is_none() {
+                return true; // No QoS — skip check
+            }
+
+            let user = &job.spec.user;
+
+            let running_count = jobs
+                .values()
+                .filter(|j| j.state == JobState::Running && j.spec.user == *user)
+                .count() as u32;
+
+            let submitted_count = jobs
+                .values()
+                .filter(|j| {
+                    (j.state == JobState::Pending || j.state == JobState::Running)
+                        && j.spec.user == *user
+                })
+                .count() as u32;
+
+            // Compute running TRES for this user (total CPUs from running jobs)
+            let mut running_tres = TresRecord::new();
+            let running_cpus: u64 = jobs
+                .values()
+                .filter(|j| j.state == JobState::Running && j.spec.user == *user)
+                .map(|j| (j.spec.num_tasks * j.spec.cpus_per_task) as u64)
+                .sum();
+            running_tres.set(TresType::Cpu, running_cpus);
+
+            // Use a default QoS (no limits) — real QoS definitions would come
+            // from the accounting database; for now this wires the enforcement
+            // path so it's ready when QoS configs are populated.
+            let qos = Qos::default();
+
+            match check_qos_limits(job, &qos, running_count, submitted_count, &running_tres) {
+                QosCheckResult::Allowed => true,
+                QosCheckResult::Blocked(_reason) => false,
+            }
         });
 
         // Recompute effective priority with age + partition tier

@@ -72,10 +72,32 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Hold { job_id } => {
-            update_job(&args.controller, job_id, None, None, Some(true)).await
+            update_job(
+                &args.controller,
+                job_id,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
         ScontrolCommand::Release { job_id } => {
-            update_job(&args.controller, job_id, None, None, Some(false)).await
+            update_job(
+                &args.controller,
+                job_id,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
         ScontrolCommand::Requeue { job_id } => {
             // Requeue = cancel + resubmit, simplified for now
@@ -297,6 +319,10 @@ async fn update_job(
     priority: Option<u32>,
     time_limit: Option<String>,
     hold: Option<bool>,
+    partition: Option<String>,
+    account: Option<String>,
+    comment: Option<String>,
+    qos: Option<String>,
 ) -> Result<()> {
     let mut client = SlurmControllerClient::connect(controller.to_string())
         .await
@@ -312,12 +338,13 @@ async fn update_job(
     client
         .update_job(spur_proto::proto::UpdateJobRequest {
             job_id,
-            partition: None,
-            account: None,
+            partition,
+            account,
             priority,
             time_limit: tl,
             hold,
-            comment: None,
+            comment,
+            qos,
         })
         .await
         .context("update failed")?;
@@ -337,6 +364,15 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     let mut job_id: Option<u32> = None;
     let mut priority: Option<u32> = None;
     let mut time_limit: Option<String> = None;
+    let mut partition: Option<String> = None;
+    let mut account: Option<String> = None;
+    let mut comment: Option<String> = None;
+    let mut qos: Option<String> = None;
+
+    // Node update fields
+    let mut node_name: Option<String> = None;
+    let mut node_state: Option<String> = None;
+    let mut node_reason: Option<String> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -344,11 +380,64 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
                 "jobid" | "job" => job_id = value.parse().ok(),
                 "priority" => priority = value.parse().ok(),
                 "timelimit" | "time_limit" => time_limit = Some(value.into()),
+                "partition" => partition = Some(value.into()),
+                "account" => account = Some(value.into()),
+                "comment" => comment = Some(value.into()),
+                "qos" => qos = Some(value.into()),
+                "nodename" | "node" => node_name = Some(value.into()),
+                "state" => node_state = Some(value.into()),
+                "reason" => node_reason = Some(value.into()),
                 other => eprintln!("scontrol: unknown update key '{}'", other),
             }
         }
     }
 
-    let jid = job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= required"))?;
-    update_job(controller, jid, priority, time_limit, None).await
+    // Node update takes priority if NodeName is specified
+    if let Some(name) = node_name {
+        return update_node(controller, &name, node_state.as_deref(), node_reason).await;
+    }
+
+    let jid =
+        job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= or NodeName= required"))?;
+    update_job(
+        controller, jid, priority, time_limit, None, partition, account, comment, qos,
+    )
+    .await
+}
+
+/// Update a node's state via the controller.
+async fn update_node(
+    controller: &str,
+    name: &str,
+    state: Option<&str>,
+    reason: Option<String>,
+) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string())
+        .await
+        .context("failed to connect to spurctld")?;
+
+    let proto_state = state.map(|s| match s.to_lowercase().as_str() {
+        "idle" | "resume" => spur_proto::proto::NodeState::NodeIdle as i32,
+        "drain" => spur_proto::proto::NodeState::NodeDrain as i32,
+        "down" => spur_proto::proto::NodeState::NodeDown as i32,
+        other => {
+            eprintln!(
+                "scontrol: unknown node state '{}', defaulting to idle",
+                other
+            );
+            spur_proto::proto::NodeState::NodeIdle as i32
+        }
+    });
+
+    client
+        .update_node(spur_proto::proto::UpdateNodeRequest {
+            name: name.to_string(),
+            state: proto_state,
+            reason,
+        })
+        .await
+        .context("node update failed")?;
+
+    println!("node {} updated", name);
+    Ok(())
 }

@@ -154,6 +154,8 @@ pub struct JobSpec {
     pub dependency: Vec<String>,
     pub nodelist: Option<String>,
     pub exclude: Option<String>,
+    /// Node feature constraint (comma-separated, all must match).
+    pub constraint: Option<String>,
 
     // Array
     pub array_spec: Option<String>,
@@ -207,6 +209,7 @@ impl Default for JobSpec {
             dependency: Vec::new(),
             nodelist: None,
             exclude: None,
+            constraint: None,
             array_spec: None,
             requeue: false,
             exclusive: false,

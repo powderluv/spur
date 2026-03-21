@@ -289,6 +289,7 @@ message UpdateJobRequest {
   optional google.protobuf.Duration time_limit = 5;
   optional bool hold = 6;
   optional string comment = 7;
+  optional string qos = 8;
 }
 
 message GetNodesRequest {

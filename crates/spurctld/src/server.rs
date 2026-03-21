@@ -113,6 +113,8 @@ impl SlurmController for ControllerService {
                 req.priority,
                 req.partition,
                 req.comment,
+                req.account,
+                req.qos,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -371,6 +373,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.exclude)
         },
+        constraint: None, // TODO: wire from proto when --constraint is added to CLI
         array_spec: if spec.array_spec.is_empty() {
             None
         } else {

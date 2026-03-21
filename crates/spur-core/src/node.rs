@@ -86,6 +86,10 @@ pub struct Node {
     pub total_resources: ResourceSet,
     pub alloc_resources: ResourceSet,
 
+    /// Node feature tags (e.g., "gpu", "nvme", "rack1") for --constraint matching.
+    #[serde(default)]
+    pub features: Vec<String>,
+
     pub arch: String,
     pub os: String,
     pub cpu_load: u32,
@@ -116,6 +120,7 @@ impl Node {
             source: NodeSource::default(),
             total_resources: resources,
             alloc_resources: ResourceSet::default(),
+            features: Vec::new(),
             arch: String::new(),
             os: String::new(),
             cpu_load: 0,

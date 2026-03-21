@@ -106,6 +106,7 @@ pub async fn launch_job(
     cpus: u32,
     memory_mb: u64,
     gpu_devices: &[u32],
+    cpu_ids: &[u32],
 ) -> anyhow::Result<RunningJob> {
     info!(job_id, work_dir, "launching job");
 
@@ -117,7 +118,7 @@ pub async fn launch_job(
     }
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb)?;
+    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -235,7 +236,12 @@ pub async fn launch_job(
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
-fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Option<PathBuf>> {
+fn setup_cgroup(
+    job_id: JobId,
+    cpus: u32,
+    memory_mb: u64,
+    cpu_ids: &[u32],
+) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_path = PathBuf::from(CGROUP_ROOT).join(format!("job_{}", job_id));
 
     // Try to create cgroup — when running as root, failure is fatal.
@@ -265,6 +271,20 @@ fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Opti
         let memory_bytes = memory_mb * 1024 * 1024;
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
             warn!(job_id, error = %e, "failed to set memory.max");
+        }
+    }
+
+    // Pin to specific CPU cores via cpuset
+    if !cpu_ids.is_empty() {
+        let cpuset_str: String = cpu_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Err(e) = std::fs::write(cgroup_path.join("cpuset.cpus"), &cpuset_str) {
+            warn!(job_id, error = %e, "failed to set cpuset.cpus");
+        } else {
+            debug!(job_id, cpuset = %cpuset_str, "cpuset pinning configured");
         }
     }
 
