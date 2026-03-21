@@ -143,6 +143,9 @@ impl ClusterManager {
             let mut job = Job::new(task_job_id, task_spec);
             job.array_job_id = Some(array_job_id);
             job.array_task_id = Some(task_id);
+            if array.max_concurrent > 0 {
+                job.array_max_concurrent = Some(array.max_concurrent);
+            }
 
             jobs.insert(task_job_id, job);
         }
@@ -624,6 +627,28 @@ impl ClusterManager {
                     false
                 }
             }
+        });
+
+        // Enforce array max_concurrent: suppress tasks if too many siblings already running
+        let running_array_counts: std::collections::HashMap<JobId, u32> = {
+            let mut counts = std::collections::HashMap::new();
+            for j in jobs.values() {
+                if j.state == JobState::Running {
+                    if let Some(aid) = j.array_job_id {
+                        *counts.entry(aid).or_insert(0) += 1;
+                    }
+                }
+            }
+            counts
+        };
+        pending.retain(|job| {
+            if let (Some(aid), Some(max)) = (job.array_job_id, job.array_max_concurrent) {
+                let running = running_array_counts.get(&aid).copied().unwrap_or(0);
+                if running >= max {
+                    return false; // Throttled — too many siblings running
+                }
+            }
+            true
         });
 
         // Recompute effective priority with age + partition tier

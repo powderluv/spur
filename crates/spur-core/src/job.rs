@@ -251,6 +251,9 @@ pub struct Job {
     // Array support
     pub array_job_id: Option<JobId>,
     pub array_task_id: Option<u32>,
+    /// Max concurrent tasks for this array (0 = unlimited).
+    #[serde(default)]
+    pub array_max_concurrent: Option<u32>,
 }
 
 impl Job {
@@ -281,6 +284,7 @@ impl Job {
             requeue_count: 0,
             array_job_id: None,
             array_task_id: None,
+            array_max_concurrent: None,
         }
     }
 
