@@ -124,52 +124,80 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 (spec.num_tasks / spec.num_nodes.max(1)).max(1)
             };
 
-            for (node_idx, node_name) in all_nodes.iter().enumerate() {
-                let node_info = cluster.get_node(node_name);
-                let (addr, port) = match node_info {
-                    Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
-                    _ => {
-                        warn!(
-                            job_id,
-                            node = %node_name,
-                            "no agent address for node, skipping dispatch"
-                        );
-                        continue;
-                    }
-                };
+            // Collect dispatch tasks to track success/failure
+            let cluster_ref = cluster.clone();
+            let dispatch_nodes = all_nodes.clone();
+            tokio::spawn(async move {
+                let mut successes = 0u32;
+                let mut failures = 0u32;
+                let total = dispatch_nodes.len() as u32;
 
-                let agent_addr = format!("http://{}:{}", addr, port);
-                let spec = spec.clone();
-                let peer_addrs = peer_addrs.clone();
-                let task_offset = node_idx as u32 * tasks_per_node;
-                let target_node = node_name.clone();
-                let allocated = per_node_alloc.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = dispatch_to_agent(
-                        &agent_addr,
-                        job_id,
-                        &spec,
-                        &peer_addrs,
-                        task_offset,
-                        &target_node,
-                        &allocated,
-                    )
-                    .await
-                    {
-                        // Log but do NOT mark job as Failed — that breaks afterok
-                        // dependencies. The job stays Running; the time-limit
-                        // enforcer will eventually clean it up if it has a
-                        // --time set. Agent completion reporting handles the
-                        // normal path.
-                        error!(
+                let mut set = tokio::task::JoinSet::new();
+                for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
+                    let node_info = cluster_ref.get_node(node_name);
+                    let (addr, port) = match node_info {
+                        Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+                        _ => {
+                            warn!(
+                                job_id,
+                                node = %node_name,
+                                "no agent address for node, skipping dispatch"
+                            );
+                            failures += 1;
+                            continue;
+                        }
+                    };
+
+                    let agent_addr = format!("http://{}:{}", addr, port);
+                    let spec = spec.clone();
+                    let peer_addrs = peer_addrs.clone();
+                    let task_offset = node_idx as u32 * tasks_per_node;
+                    let target_node = node_name.clone();
+                    let allocated = per_node_alloc.clone();
+                    set.spawn(async move {
+                        dispatch_to_agent(
+                            &agent_addr,
                             job_id,
-                            agent = %agent_addr,
-                            error = %e,
-                            "failed to dispatch job to agent"
-                        );
+                            &spec,
+                            &peer_addrs,
+                            task_offset,
+                            &target_node,
+                            &allocated,
+                        )
+                        .await
+                    });
+                }
+
+                while let Some(result) = set.join_next().await {
+                    match result {
+                        Ok(Ok(())) => successes += 1,
+                        Ok(Err(e)) => {
+                            error!(job_id, error = %e, "dispatch to agent failed");
+                            failures += 1;
+                        }
+                        Err(e) => {
+                            error!(job_id, error = %e, "dispatch task panicked");
+                            failures += 1;
+                        }
                     }
-                });
-            }
+                }
+
+                // If ALL dispatches failed, mark job as Failed
+                if successes == 0 && total > 0 {
+                    error!(
+                        job_id,
+                        failures, "all dispatches failed — marking job as Failed"
+                    );
+                    let _ = cluster_ref.complete_job(job_id, -1, spur_core::job::JobState::Failed);
+                } else if failures > 0 {
+                    warn!(
+                        job_id,
+                        successes,
+                        failures,
+                        "partial dispatch failure — job continues on successful nodes"
+                    );
+                }
+            });
         }
     }
 }
