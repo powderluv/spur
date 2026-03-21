@@ -91,6 +91,9 @@ impl ClusterManager {
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, spec: JobSpec) -> anyhow::Result<JobId> {
+        // Validate partition constraints before accepting the job
+        self.validate_partition(&spec)?;
+
         // Check for array job
         if let Some(ref array_spec) = spec.array_spec {
             return self.submit_array_job(spec.clone(), array_spec);
@@ -152,6 +155,79 @@ impl ClusterManager {
 
         // Return the array job ID (first task IDs are array_job_id + 1, +2, ...)
         Ok(array_job_id)
+    }
+
+    /// Validate partition constraints: access control and node limits.
+    fn validate_partition(&self, spec: &JobSpec) -> anyhow::Result<()> {
+        let partition_name = match spec.partition.as_ref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(()), // No partition specified — default, no restrictions
+        };
+
+        let partitions = self.partitions.read();
+        let part = match partitions.iter().find(|p| p.name == *partition_name) {
+            Some(p) => p,
+            None => anyhow::bail!("partition '{}' not found", partition_name),
+        };
+
+        // Check partition state
+        if part.state != spur_core::partition::PartitionState::Up {
+            anyhow::bail!(
+                "partition '{}' is {}",
+                partition_name,
+                part.state.display()
+            );
+        }
+
+        // Check allow_accounts (if non-empty, user's account must be in the list)
+        if !part.allow_accounts.is_empty() {
+            let account = spec.account.as_deref().unwrap_or("");
+            if !part.allow_accounts.iter().any(|a| a == account) {
+                anyhow::bail!(
+                    "account '{}' not allowed on partition '{}'",
+                    account,
+                    partition_name
+                );
+            }
+        }
+
+        // Check deny_accounts
+        if let Some(ref account) = spec.account {
+            if part.deny_accounts.iter().any(|a| a == account) {
+                anyhow::bail!(
+                    "account '{}' denied on partition '{}'",
+                    account,
+                    partition_name
+                );
+            }
+        }
+
+        // Check max_nodes
+        if let Some(max) = part.max_nodes {
+            if spec.num_nodes > max {
+                anyhow::bail!(
+                    "requested {} nodes exceeds partition '{}' max of {}",
+                    spec.num_nodes,
+                    partition_name,
+                    max
+                );
+            }
+        }
+
+        // Check max_time
+        if let (Some(max_mins), Some(ref tl)) = (part.max_time_minutes, &spec.time_limit) {
+            let requested_mins = tl.num_minutes() as u32;
+            if requested_mins > max_mins {
+                anyhow::bail!(
+                    "requested time {} min exceeds partition '{}' max of {} min",
+                    requested_mins,
+                    partition_name,
+                    max_mins
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Get a job by ID.
