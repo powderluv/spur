@@ -194,7 +194,15 @@ fn resolve_partition_field(
                 "infinite".into()
             }
         }
-        'D' => part.total_nodes.to_string(),
+        'D' => {
+            // part.total_nodes may be 0 (not populated by server),
+            // so fall back to the actual node count from the query.
+            if nodes.is_empty() && part.total_nodes > 0 {
+                part.total_nodes.to_string()
+            } else {
+                nodes.len().to_string()
+            }
+        }
         't' | 'T' => {
             // Summarize node states
             if nodes.is_empty() {
