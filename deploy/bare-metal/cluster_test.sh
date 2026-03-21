@@ -81,7 +81,7 @@ job_state() {
     # Note: avoid tail in the pipeline; when awk exits early (after finding the job),
     # tail would get SIGPIPE and exit 141, causing set -o pipefail to abort the script
     # once the queue grows large enough that there are unread lines remaining.
-    "${SPUR}/squeue" 2>/dev/null | awk -v id="${job_id}" '
+    "${SPUR}/squeue" -t all 2>/dev/null | awk -v id="${job_id}" '
         NR == 1 { next }
         $1 == id {
             # Find the 2-char state code (CD, PD, R, F, CA)
