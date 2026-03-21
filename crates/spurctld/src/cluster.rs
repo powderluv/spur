@@ -340,7 +340,10 @@ impl ClusterManager {
 
         // Check for requeue: if the job has --requeue and hit a retriable state,
         // reset it to Pending so the scheduler picks it up again.
-        let should_requeue = matches!(state, JobState::Timeout | JobState::Preempted | JobState::NodeFail);
+        let should_requeue = matches!(
+            state,
+            JobState::Timeout | JobState::Preempted | JobState::NodeFail
+        );
         if should_requeue {
             self.maybe_requeue(job_id);
         }
