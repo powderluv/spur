@@ -236,7 +236,12 @@ pub async fn launch_job(
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
-fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64, cpu_ids: &[u32]) -> anyhow::Result<Option<PathBuf>> {
+fn setup_cgroup(
+    job_id: JobId,
+    cpus: u32,
+    memory_mb: u64,
+    cpu_ids: &[u32],
+) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_path = PathBuf::from(CGROUP_ROOT).join(format!("job_{}", job_id));
 
     // Try to create cgroup — when running as root, failure is fatal.

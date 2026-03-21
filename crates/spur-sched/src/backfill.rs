@@ -102,9 +102,15 @@ impl BackfillScheduler {
                 }
                 // Check --constraint: all requested features must be present on the node
                 if let Some(ref constraint) = job.spec.constraint {
-                    let required_features: Vec<&str> =
-                        constraint.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-                    if !required_features.iter().all(|f| node.features.contains(&f.to_string())) {
+                    let required_features: Vec<&str> = constraint
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !required_features
+                        .iter()
+                        .all(|f| node.features.contains(&f.to_string()))
+                    {
                         return false;
                     }
                 }

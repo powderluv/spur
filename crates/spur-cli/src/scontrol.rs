@@ -72,12 +72,32 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Hold { job_id } => {
-            update_job(&args.controller, job_id, None, None, Some(true), None, None, None, None)
-                .await
+            update_job(
+                &args.controller,
+                job_id,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
         ScontrolCommand::Release { job_id } => {
-            update_job(&args.controller, job_id, None, None, Some(false), None, None, None, None)
-                .await
+            update_job(
+                &args.controller,
+                job_id,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
         ScontrolCommand::Requeue { job_id } => {
             // Requeue = cancel + resubmit, simplified for now
@@ -377,8 +397,12 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         return update_node(controller, &name, node_state.as_deref(), node_reason).await;
     }
 
-    let jid = job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= or NodeName= required"))?;
-    update_job(controller, jid, priority, time_limit, None, partition, account, comment, qos).await
+    let jid =
+        job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= or NodeName= required"))?;
+    update_job(
+        controller, jid, priority, time_limit, None, partition, account, comment, qos,
+    )
+    .await
 }
 
 /// Update a node's state via the controller.
@@ -397,7 +421,10 @@ async fn update_node(
         "drain" => spur_proto::proto::NodeState::NodeDrain as i32,
         "down" => spur_proto::proto::NodeState::NodeDown as i32,
         other => {
-            eprintln!("scontrol: unknown node state '{}', defaulting to idle", other);
+            eprintln!(
+                "scontrol: unknown node state '{}', defaulting to idle",
+                other
+            );
             spur_proto::proto::NodeState::NodeIdle as i32
         }
     });
