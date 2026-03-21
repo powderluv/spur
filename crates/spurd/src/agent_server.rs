@@ -369,6 +369,11 @@ impl SlurmAgent for AgentService {
             .map(|a| a.gpu_ids.clone())
             .unwrap_or_default();
 
+        let cpu_ids: Vec<u32> = alloc_result
+            .as_ref()
+            .map(|a| a.cpu_ids.clone())
+            .unwrap_or_default();
+
         // Resolve stdout/stderr paths
         let stdout_path = if spec.stdout_path.is_empty() {
             format!("{}/spur-{}.out", work_dir, job_id)
@@ -392,6 +397,7 @@ impl SlurmAgent for AgentService {
             spec.cpus_per_task.max(1),
             spec.memory_per_node_mb,
             &gpu_devices,
+            &cpu_ids,
         )
         .await
         {
