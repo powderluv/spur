@@ -169,4 +169,49 @@ mod tests {
         // These are large sentinel values
         assert!(STEP_BATCH > 1_000_000);
     }
+
+    // ── T01.15: LOCAL_RANK computation for multi-task ────────────
+
+    #[test]
+    fn t01_15_local_rank_computation() {
+        // Simulates multi-task per-node: tasks_per_node = 4, task_offset = 8
+        // LOCAL_RANK should be 0..3, SPUR_PROCID should be 8..11
+        let tasks_per_node = 4u32;
+        let task_offset = 8u32;
+        for local_rank in 0..tasks_per_node {
+            let procid = task_offset + local_rank;
+            assert_eq!(procid, 8 + local_rank);
+            assert!(local_rank < tasks_per_node);
+        }
+    }
+
+    #[test]
+    fn t01_16_gpu_partitioning_across_tasks() {
+        // 8 GPUs across 4 tasks → 2 GPUs per task
+        let gpu_devices: Vec<u32> = (0..8).collect();
+        let num_tasks = 4u32;
+        let gpus_per_task = gpu_devices.len() / num_tasks as usize;
+        assert_eq!(gpus_per_task, 2);
+
+        for local_rank in 0..num_tasks {
+            let start = local_rank as usize * gpus_per_task;
+            let end = start + gpus_per_task;
+            let task_gpus: Vec<u32> = gpu_devices[start..end].to_vec();
+            assert_eq!(task_gpus.len(), 2);
+            // First task gets GPUs 0,1; second gets 2,3; etc.
+            assert_eq!(task_gpus[0], local_rank * 2);
+            assert_eq!(task_gpus[1], local_rank * 2 + 1);
+        }
+    }
+
+    #[test]
+    fn t01_17_node_rank_from_task_offset() {
+        // Multi-node: 2 nodes, 4 tasks per node
+        // Node 0: task_offset=0, Node 1: task_offset=4
+        let tasks_per_node = 4u32;
+        let node_rank_0 = 0u32 / tasks_per_node;
+        let node_rank_1 = 4u32 / tasks_per_node;
+        assert_eq!(node_rank_0, 0);
+        assert_eq!(node_rank_1, 1);
+    }
 }

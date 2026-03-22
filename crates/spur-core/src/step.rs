@@ -272,4 +272,44 @@ mod tests {
         assert_eq!(TaskDistribution::from_str("block"), TaskDistribution::Block);
         assert_eq!(TaskDistribution::from_str("plane"), TaskDistribution::Plane);
     }
+
+    #[test]
+    fn test_block_distribution_local_ranks() {
+        // 8 tasks across 2 nodes, block distribution
+        // Block: tasks 0-3 on node 0, tasks 4-7 on node 1
+        let tasks = distribute_tasks(8, 2, TaskDistribution::Block);
+        assert_eq!(tasks[0], 0); // task 0 -> node 0
+        assert_eq!(tasks[3], 0); // task 3 -> node 0
+        assert_eq!(tasks[4], 1); // task 4 -> node 1
+        assert_eq!(tasks[7], 1); // task 7 -> node 1
+
+        // Per-node local ranks: node 0 gets tasks 0..3 (local 0..3)
+        let node0_tasks: Vec<usize> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, &n)| n == 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(node0_tasks.len(), 4);
+        // local_rank for each task on node 0
+        for (local_rank, &global_task) in node0_tasks.iter().enumerate() {
+            assert_eq!(local_rank, global_task);
+        }
+    }
+
+    #[test]
+    fn test_cyclic_distribution_local_ranks() {
+        // 8 tasks across 2 nodes, cyclic distribution
+        // Cyclic: tasks 0,2,4,6 on node 0; tasks 1,3,5,7 on node 1
+        let tasks = distribute_tasks(8, 2, TaskDistribution::Cyclic);
+        assert_eq!(tasks[0], 0); // task 0 -> node 0
+        assert_eq!(tasks[1], 1); // task 1 -> node 1
+        assert_eq!(tasks[2], 0); // task 2 -> node 0
+        assert_eq!(tasks[3], 1); // task 3 -> node 1
+
+        let node0_count = tasks.iter().filter(|&&n| n == 0).count();
+        let node1_count = tasks.iter().filter(|&&n| n == 1).count();
+        assert_eq!(node0_count, 4);
+        assert_eq!(node1_count, 4);
+    }
 }

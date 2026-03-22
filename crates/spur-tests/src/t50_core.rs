@@ -545,4 +545,29 @@ mod tests {
         let spec = spur_core::job::JobSpec::default();
         assert!(!spec.interactive);
     }
+
+    // ── T50.47–49: MPI / distribution fields ────────────────────
+
+    #[test]
+    fn t50_47_mpi_field_default_none() {
+        let spec = spur_core::job::JobSpec::default();
+        assert!(spec.mpi.is_none());
+    }
+
+    #[test]
+    fn t50_48_distribution_field_default_none() {
+        let spec = spur_core::job::JobSpec::default();
+        assert!(spec.distribution.is_none());
+    }
+
+    #[test]
+    fn t50_49_mpi_field_set() {
+        let spec = spur_core::job::JobSpec {
+            mpi: Some("pmix".into()),
+            distribution: Some("cyclic".into()),
+            ..Default::default()
+        };
+        assert_eq!(spec.mpi.as_deref(), Some("pmix"));
+        assert_eq!(spec.distribution.as_deref(), Some("cyclic"));
+    }
 }
