@@ -408,6 +408,68 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
+        // Multi-task per-node: wrap the user script so it forks N processes,
+        // each with a distinct LOCAL_RANK. The wrapper backgrounds N copies and
+        // waits for all to finish, so TrackedJob only tracks a single PID (the
+        // wrapper shell). GPU devices are partitioned across tasks via
+        // ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES overrides in each fork.
+        let launch_script = if tasks_per_node > 1 {
+            // Write the user script to disk first so the wrapper can reference it
+            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
+            std::fs::write(&user_script_path, &launch_script)
+                .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &user_script_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+
+            // Build the wrapper that launches N tasks with GPU partitioning
+            let mut wrapper = String::from("#!/bin/bash\n");
+            wrapper.push_str(&format!(
+                "SPUR_NTASKS={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
+                tasks_per_node
+            ));
+            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((SPUR_NTASKS - 1))); do\n");
+            wrapper.push_str("  export LOCAL_RANK\n");
+            wrapper.push_str("  export SPUR_LOCALID=$LOCAL_RANK\n");
+            wrapper.push_str(
+                "  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n",
+            );
+            wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
+
+            // Partition GPUs across tasks if GPUs are allocated
+            wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
+            wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
+            wrapper.push_str(
+                "    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / SPUR_NTASKS ))\n",
+            );
+            wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
+            wrapper.push_str(
+                "      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n",
+            );
+            wrapper.push_str(
+                "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
+            );
+            wrapper.push_str("      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS\n");
+            wrapper.push_str("      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS\n");
+            wrapper.push_str("      export GPU_DEVICE_ORDINAL=$_TASK_GPUS\n");
+            wrapper.push_str("    fi\n");
+            wrapper.push_str("  fi\n");
+
+            wrapper.push_str(&format!(
+                "  bash \"{}\" &\n",
+                user_script_path.replace('"', "\\\"")
+            ));
+            wrapper.push_str("done\nwait\n");
+            wrapper
+        } else {
+            launch_script
+        };
+
         // Allocate GPU devices from the node's pool
         let mut gpu_count = 0u32;
         let mut gpu_type: Option<String> = None;
