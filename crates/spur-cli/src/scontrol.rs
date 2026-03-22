@@ -49,6 +49,34 @@ pub enum ScontrolCommand {
         /// Job ID
         job_id: u32,
     },
+    /// Create a reservation
+    #[command(name = "create-reservation")]
+    CreateReservation {
+        /// Reservation name
+        #[arg(long)]
+        name: String,
+        /// Start time (ISO 8601 or "now")
+        #[arg(long, default_value = "now")]
+        start_time: String,
+        /// Duration in minutes
+        #[arg(long)]
+        duration: u32,
+        /// Comma-separated node names
+        #[arg(long)]
+        nodes: String,
+        /// Comma-separated accounts (optional)
+        #[arg(long, default_value = "")]
+        accounts: String,
+        /// Comma-separated users (optional)
+        #[arg(long, default_value = "")]
+        users: String,
+    },
+    /// Delete a reservation
+    #[command(name = "delete-reservation")]
+    DeleteReservation {
+        /// Reservation name
+        name: String,
+    },
     /// Ping the controller
     Ping,
     /// Show version
@@ -116,6 +144,28 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Update { params } => parse_and_update(&args.controller, &params).await,
+        ScontrolCommand::CreateReservation {
+            name,
+            start_time,
+            duration,
+            nodes,
+            accounts,
+            users,
+        } => {
+            create_reservation(
+                &args.controller,
+                &name,
+                &start_time,
+                duration,
+                &nodes,
+                &accounts,
+                &users,
+            )
+            .await
+        }
+        ScontrolCommand::DeleteReservation { name } => {
+            delete_reservation(&args.controller, &name).await
+        }
     }
 }
 
@@ -241,6 +291,26 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!();
             }
         }
+        "reservation" | "reservations" => {
+            let resp = client
+                .list_reservations(spur_proto::proto::ListReservationsRequest {})
+                .await
+                .context("failed to list reservations")?;
+
+            for res in resp.into_inner().reservations {
+                println!("ReservationName={}", res.name);
+                println!("   StartTime={}", res.start_time);
+                println!("   EndTime={}", res.end_time);
+                println!("   Nodes={}", res.nodes);
+                if !res.accounts.is_empty() {
+                    println!("   Accounts={}", res.accounts);
+                }
+                if !res.users.is_empty() {
+                    println!("   Users={}", res.users);
+                }
+                println!();
+            }
+        }
         "config" => {
             println!("ClusterName=spur");
             println!("SlurmctldAddr={}", controller);
@@ -248,7 +318,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, config",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, config",
                 other
             );
         }
@@ -439,5 +509,68 @@ async fn update_node(
         .context("node update failed")?;
 
     println!("node {} updated", name);
+    Ok(())
+}
+
+/// Create a reservation via the controller.
+async fn create_reservation(
+    controller: &str,
+    name: &str,
+    start_time: &str,
+    duration: u32,
+    nodes: &str,
+    accounts: &str,
+    users: &str,
+) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string())
+        .await
+        .context("failed to connect to spurctld")?;
+
+    let node_list: Vec<String> = nodes
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let account_list: Vec<String> = accounts
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let user_list: Vec<String> = users
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    client
+        .create_reservation(spur_proto::proto::CreateReservationRequest {
+            name: name.to_string(),
+            start_time: start_time.to_string(),
+            duration_minutes: duration,
+            nodes: node_list,
+            accounts: account_list,
+            users: user_list,
+        })
+        .await
+        .context("failed to create reservation")?;
+
+    println!("Reservation {} created", name);
+    Ok(())
+}
+
+/// Delete a reservation via the controller.
+async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string())
+        .await
+        .context("failed to connect to spurctld")?;
+
+    client
+        .delete_reservation(spur_proto::proto::DeleteReservationRequest {
+            name: name.to_string(),
+        })
+        .await
+        .context("failed to delete reservation")?;
+
+    println!("Reservation {} deleted", name);
     Ok(())
 }

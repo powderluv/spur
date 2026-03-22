@@ -12,6 +12,7 @@ use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
 use spur_core::node::{Node, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
+use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
 use spur_core::wal::{WalEntry, WalOperation, WalStore};
 use spur_state::snapshot::SnapshotStore;
@@ -26,6 +27,7 @@ pub struct ClusterManager {
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
     next_job_id: AtomicU32,
+    reservations: RwLock<Vec<Reservation>>,
     wal: RwLock<FileWalStore>,
     snapshot: RwLock<Option<SnapshotStore>>,
     wal_since_snapshot: AtomicU32,
@@ -84,6 +86,7 @@ impl ClusterManager {
             jobs: RwLock::new(jobs),
             nodes: RwLock::new(nodes),
             partitions: RwLock::new(partitions),
+            reservations: RwLock::new(Vec::new()),
             next_job_id: AtomicU32::new(next_id),
             wal: RwLock::new(wal),
             snapshot: RwLock::new(snapshot),
@@ -880,6 +883,34 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Create a new reservation.
+    pub fn create_reservation(&self, res: Reservation) -> anyhow::Result<()> {
+        let mut reservations = self.reservations.write();
+        if reservations.iter().any(|r| r.name == res.name) {
+            anyhow::bail!("reservation '{}' already exists", res.name);
+        }
+        info!(name = %res.name, "reservation created");
+        reservations.push(res);
+        Ok(())
+    }
+
+    /// Delete a reservation by name.
+    pub fn delete_reservation(&self, name: &str) -> anyhow::Result<()> {
+        let mut reservations = self.reservations.write();
+        let len_before = reservations.len();
+        reservations.retain(|r| r.name != name);
+        if reservations.len() == len_before {
+            anyhow::bail!("reservation '{}' not found", name);
+        }
+        info!(name, "reservation deleted");
+        Ok(())
+    }
+
+    /// Get all reservations.
+    pub fn get_reservations(&self) -> Vec<Reservation> {
+        self.reservations.read().clone()
+    }
+
     /// Send a job event notification via webhook (if configured).
     ///
     /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
@@ -967,44 +998,6 @@ impl ClusterManager {
                 Err(e) => warn!(error = %e, "failed to take snapshot"),
             }
         }
-    }
-
-    /// Send a job event notification (best-effort webhook POST).
-    fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
-        let webhook_url = match &self.config.notifications.webhook_url {
-            Some(url) if !url.is_empty() => url.clone(),
-            _ => return, // No webhook configured
-        };
-
-        let mail_user = spec.mail_user.clone().unwrap_or_default();
-        info!(
-            job_id,
-            event,
-            mail_user = %mail_user,
-            "sending job notification"
-        );
-
-        // Fire-and-forget: don't block the caller on HTTP
-        let event = event.to_string();
-        let job_name = spec.name.clone();
-        tokio::spawn(async move {
-            let body = serde_json::json!({
-                "job_id": job_id,
-                "event": event,
-                "job_name": job_name,
-                "mail_user": mail_user,
-            });
-            let client = reqwest::Client::new();
-            if let Err(e) = client
-                .post(&webhook_url)
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-            {
-                warn!(job_id, event = %event, error = %e, "notification webhook failed");
-            }
-        });
     }
 }
 

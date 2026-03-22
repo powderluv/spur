@@ -231,6 +231,11 @@ service SlurmController {
 
   // K8s operator callback: report job completion from Pod watcher
   rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
+
+  // Reservation management
+  rpc CreateReservation(CreateReservationRequest) returns (google.protobuf.Empty);
+  rpc DeleteReservation(DeleteReservationRequest) returns (google.protobuf.Empty);
+  rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -569,4 +574,36 @@ message QosInfo {
   uint32 max_jobs_per_user = 6;
   uint32 max_wall_minutes = 7;
   string max_tres_per_job = 8;
+}
+
+// ============================================================
+// Reservation Management
+// ============================================================
+
+message CreateReservationRequest {
+  string name = 1;
+  string start_time = 2;      // ISO 8601 or "now"
+  uint32 duration_minutes = 3;
+  repeated string nodes = 4;
+  repeated string accounts = 5;
+  repeated string users = 6;
+}
+
+message DeleteReservationRequest {
+  string name = 1;
+}
+
+message ListReservationsRequest { }
+
+message ListReservationsResponse {
+  repeated ReservationInfo reservations = 1;
+}
+
+message ReservationInfo {
+  string name = 1;
+  string start_time = 2;
+  string end_time = 3;
+  string nodes = 4;
+  string accounts = 5;
+  string users = 6;
 }

@@ -8,6 +8,7 @@ pub mod job;
 pub mod node;
 pub mod partition;
 pub mod qos;
+pub mod reservation;
 pub mod resource;
 pub mod step;
 pub mod wal;

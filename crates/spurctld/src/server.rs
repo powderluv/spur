@@ -271,6 +271,72 @@ impl SlurmController for ControllerService {
             rx,
         )))
     }
+
+    async fn create_reservation(
+        &self,
+        request: Request<CreateReservationRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+
+        let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
+        {
+            chrono::Utc::now()
+        } else {
+            req.start_time
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
+        };
+
+        let end_time =
+            start_time + chrono::Duration::minutes(req.duration_minutes as i64);
+
+        let reservation = spur_core::reservation::Reservation {
+            name: req.name,
+            start_time,
+            end_time,
+            nodes: req.nodes,
+            accounts: req.accounts,
+            users: req.users,
+        };
+
+        self.cluster
+            .create_reservation(reservation)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn delete_reservation(
+        &self,
+        request: Request<DeleteReservationRequest>,
+    ) -> Result<Response<()>, Status> {
+        let name = request.into_inner().name;
+        self.cluster
+            .delete_reservation(&name)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_reservations(
+        &self,
+        _request: Request<ListReservationsRequest>,
+    ) -> Result<Response<ListReservationsResponse>, Status> {
+        let reservations = self.cluster.get_reservations();
+        let infos: Vec<ReservationInfo> = reservations
+            .iter()
+            .map(|r| ReservationInfo {
+                name: r.name.clone(),
+                start_time: r.start_time.to_rfc3339(),
+                end_time: r.end_time.to_rfc3339(),
+                nodes: r.nodes.join(","),
+                accounts: r.accounts.join(","),
+                users: r.users.join(","),
+            })
+            .collect();
+        Ok(Response::new(ListReservationsResponse {
+            reservations: infos,
+        }))
+    }
 }
 
 pub async fn serve(addr: SocketAddr, cluster: Arc<ClusterManager>) -> anyhow::Result<()> {
