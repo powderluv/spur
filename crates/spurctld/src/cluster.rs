@@ -360,7 +360,11 @@ impl ClusterManager {
         debug!(job_id, "job started");
 
         // Send BEGIN notification if configured
-        if spec_for_notify.mail_type.iter().any(|t| t == "BEGIN" || t == "ALL") {
+        if spec_for_notify
+            .mail_type
+            .iter()
+            .any(|t| t == "BEGIN" || t == "ALL")
+        {
             self.send_notification(job_id, "BEGIN", &spec_for_notify);
         }
 

@@ -78,12 +78,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         gres.push(format!("gpu:{}", gpus));
     }
 
-    let time_limit = spur_core::config::parse_time_minutes(&args.time).map(|mins| {
-        prost_types::Duration {
+    let time_limit =
+        spur_core::config::parse_time_minutes(&args.time).map(|mins| prost_types::Duration {
             seconds: mins as i64 * 60,
             nanos: 0,
-        }
-    });
+        });
 
     let memory_mb = args
         .mem
@@ -157,6 +156,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     });
 
     // Wait for the job to start running
+    #[allow(unused_assignments)]
     let mut nodelist = String::new();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -172,10 +172,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     }
                     3..=7 => {
                         // Terminal
-                        eprintln!(
-                            "salloc: job {} ended before allocation was granted",
-                            job_id
-                        );
+                        eprintln!("salloc: job {} ended before allocation was granted", job_id);
                         std::process::exit(1);
                     }
                     _ => {} // Still pending
@@ -187,10 +184,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    eprintln!(
-        "salloc: Nodes {} are ready for job {}",
-        nodelist, job_id
-    );
+    eprintln!("salloc: Nodes {} are ready for job {}", nodelist, job_id);
     eprintln!("salloc: Granted job allocation {}", job_id);
 
     // Spawn interactive shell with allocation env vars

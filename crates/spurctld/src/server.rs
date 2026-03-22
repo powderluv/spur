@@ -287,8 +287,7 @@ impl SlurmController for ControllerService {
                 .map_err(|e| Status::invalid_argument(format!("invalid start_time: {}", e)))?
         };
 
-        let end_time =
-            start_time + chrono::Duration::minutes(req.duration_minutes as i64);
+        let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
 
         let reservation = spur_core::reservation::Reservation {
             name: req.name,

@@ -250,4 +250,14 @@ mod tests {
         );
         assert!(job.spec.exclusive);
     }
+
+    // ── T17.18: License GRES format ─────────────────────────────
+
+    #[test]
+    fn t17_18_license_gres_format() {
+        // Test that license parsing produces correct GRES format
+        let gres = "license:fluent:5";
+        let parsed = spur_core::resource::parse_gres(gres);
+        assert_eq!(parsed, Some(("license".into(), Some("fluent".into()), 5)));
+    }
 }

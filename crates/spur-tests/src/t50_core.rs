@@ -515,4 +515,34 @@ mod tests {
         assert!(!NodeState::Error.is_available());
         assert!(!NodeState::Unknown.is_available());
     }
+
+    // ── T50.44: Mail type field ─────────────────────────────────
+
+    #[test]
+    fn t50_44_mail_type_field() {
+        let spec = spur_core::job::JobSpec {
+            mail_type: vec!["BEGIN".into(), "END".into()],
+            mail_user: Some("alice@example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(spec.mail_type.len(), 2);
+        assert_eq!(spec.mail_user.as_deref(), Some("alice@example.com"));
+    }
+
+    // ── T50.45: Interactive flag ────────────────────────────────
+
+    #[test]
+    fn t50_45_interactive_flag() {
+        let spec = spur_core::job::JobSpec {
+            interactive: true,
+            ..Default::default()
+        };
+        assert!(spec.interactive);
+    }
+
+    #[test]
+    fn t50_46_interactive_default_false() {
+        let spec = spur_core::job::JobSpec::default();
+        assert!(!spec.interactive);
+    }
 }
