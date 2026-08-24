@@ -103,7 +103,7 @@ mod tests {
 
         let mut node = NodeAllocation::new("gpu001".into(), &resources);
         let alloc = node
-            .allocate_for_job(1, 32, 128_000, &[0, 1, 2, 3])
+            .allocate_for_job(1, 1, 32, 128_000, &[0, 1, 2, 3])
             .unwrap();
 
         assert_eq!(alloc.cpu_ids.len(), 32);
@@ -122,8 +122,8 @@ mod tests {
         };
         let mut node = NodeAllocation::new("cpu001".into(), &resources);
 
-        let a1 = node.allocate_for_job(1, 16, 64_000, &[]).unwrap();
-        let a2 = node.allocate_for_job(2, 16, 64_000, &[]).unwrap();
+        let a1 = node.allocate_for_job(1, 1, 16, 64_000, &[]).unwrap();
+        let a2 = node.allocate_for_job(2, 1, 16, 64_000, &[]).unwrap();
 
         // No CPU overlap
         for id in &a1.cpu_ids {
@@ -140,7 +140,7 @@ mod tests {
         };
         let mut node = NodeAllocation::new("cpu001".into(), &resources);
 
-        node.allocate_for_job(1, 32, 128_000, &[]).unwrap();
+        node.allocate_for_job(1, 1, 32, 128_000, &[]).unwrap();
         assert_eq!(node.free_cpus(), 32);
 
         node.release_job(1);

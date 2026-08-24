@@ -602,6 +602,15 @@ impl SlurmAgent for VirtualAgent {
         }))
     }
 
+    async fn probe_stepd(
+        &self,
+        _request: Request<StepdProbeRequest>,
+    ) -> Result<Response<StepdProbeResponse>, Status> {
+        // k8s-backed jobs run as pods, never under a native Stepd, so
+        // they never enter the native recovery/fencing path that calls this.
+        Ok(Response::new(StepdProbeResponse { active: false }))
+    }
+
     async fn exec_in_job(
         &self,
         request: Request<ExecInJobRequest>,
