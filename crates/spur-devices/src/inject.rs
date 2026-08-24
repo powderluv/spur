@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::cdi::spec::{ContainerEdits, DeviceNode, Mount};
@@ -48,14 +49,14 @@ impl MergedEdits {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BindMountPlan {
     pub source: String,
     pub target: String,
     pub readonly: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceNodePlan {
     pub host_path: String,
     pub container_path: String,
@@ -67,7 +68,7 @@ pub struct DeviceNodePlan {
     pub gid: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HookPlan {
     pub hook_name: String,
     pub path: String,
@@ -75,7 +76,7 @@ pub struct HookPlan {
     pub env: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ContainerInjectionPlan {
     pub device_nodes: Vec<DeviceNodePlan>,
     pub mounts: Vec<BindMountPlan>,
@@ -84,7 +85,7 @@ pub struct ContainerInjectionPlan {
     pub additional_gids: Vec<u32>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HostInjectionPlan {
     pub env: HashMap<String, String>,
     pub visible_devices: Vec<String>,

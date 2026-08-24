@@ -37,6 +37,8 @@ libc = "0.2"
 hostname = "0.4.2"
 tokio-stream = "0.1"
 shlex = "2"
+subtle = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
