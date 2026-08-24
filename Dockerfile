@@ -52,6 +52,7 @@ RUN cargo build --release --locked \
     --bin spur \
     --bin spurctld \
     --bin spurd \
+    --bin spurstepd \
     --bin spur-k8s-operator
 
 RUN if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \
@@ -80,7 +81,7 @@ RUN mkdir -p /dist/lib/spur && \
     fi
 
 RUN echo "=== Required GLIBC versions ===" && \
-    for bin in spur spurctld spurd spur-k8s-operator; do \
+    for bin in spur spurctld spurd spurstepd spur-k8s-operator; do \
         MAX=$(objdump -T target/release/${bin} 2>/dev/null \
             | grep -oP 'GLIBC_\d+\.\d+' | sort -uV | tail -1); \
         echo "  ${bin}: requires ${MAX:-none}"; \
@@ -96,6 +97,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/target/release/spur /usr/local/bin/
 COPY --from=builder /build/target/release/spurctld /usr/local/bin/
 COPY --from=builder /build/target/release/spurd /usr/local/bin/
+COPY --from=builder /build/target/release/spurstepd /usr/local/bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /usr/local/bin/
 
 RUN groupadd --gid 1001 spur && useradd --uid 1001 --gid spur --no-create-home --shell /usr/sbin/nologin spur
@@ -109,6 +111,7 @@ FROM scratch AS dist
 COPY --from=builder /build/target/release/spur /bin/
 COPY --from=builder /build/target/release/spurctld /bin/
 COPY --from=builder /build/target/release/spurd /bin/
+COPY --from=builder /build/target/release/spurstepd /bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /bin/
 # spur_mpi_pmix.so is included only when BUILD_MPI_PLUGIN=1 (see builder stage).
 COPY --from=builder /dist/lib/spur/ /lib/spur/

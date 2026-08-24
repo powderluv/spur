@@ -335,7 +335,7 @@ where
 
 /// Sibling of the stepd store root, not inside it, so directory
 /// scans over session state (`discover_live`, `prune_finalized`) never see it.
-pub(crate) const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
+pub const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
 const STEPD_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1005,7 +1005,7 @@ async fn serve_supervisor_connection(
 
 pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if args.len() != 4 {
-        anyhow::bail!("usage: spurd __stepd <state-dir> <job-id> <attempt> <launch-spec>");
+        anyhow::bail!("usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>");
     }
     let state_dir = PathBuf::from(&args[0]);
     let job_id: u32 = args[1]
@@ -1193,14 +1193,14 @@ pub(crate) enum StepdLiveness {
 }
 
 #[derive(Debug)]
-pub(crate) struct DiscoveredStepds {
+pub struct DiscoveredStepds {
     pub live: Vec<StepdDescriptor>,
     pub stale: Vec<StepdDescriptor>,
     pub rejected: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingStepdCompletion {
+pub struct PendingStepdCompletion {
     pub job_id: u32,
     pub run_attempt: u32,
     pub step_id: spur_core::step::StepId,
@@ -1297,7 +1297,7 @@ impl StepdStore {
         fs::File::open(session_dir)?.sync_all()
     }
 
-    pub(crate) fn discover_live(&self) -> io::Result<DiscoveredStepds> {
+    pub fn discover_live(&self) -> io::Result<DiscoveredStepds> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1344,9 +1344,7 @@ impl StepdStore {
         })
     }
 
-    pub(crate) fn discover_unacknowledged_completions(
-        &self,
-    ) -> io::Result<Vec<PendingStepdCompletion>> {
+    pub fn discover_unacknowledged_completions(&self) -> io::Result<Vec<PendingStepdCompletion>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1399,7 +1397,7 @@ impl StepdStore {
         Ok(completions)
     }
 
-    pub(crate) fn prune_finalized(&self) -> io::Result<usize> {
+    pub fn prune_finalized(&self) -> io::Result<usize> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),

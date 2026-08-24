@@ -3835,6 +3835,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-stepd"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "spurd",
+ "tokio",
+]
+
+[[package]]
 name = "spur-tests"
 version = "0.11.0"
 dependencies = [

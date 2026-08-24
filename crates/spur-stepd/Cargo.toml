@@ -1,0 +1,22 @@
+[package]
+name = "spur-stepd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "spurstepd"
+path = "src/main.rs"
+
+[dependencies]
+# Reuses spurd's job-launch primitives (executor, container, stepd
+# supervision) as a library, without linking spurd's controller-RPC, k0s, or
+# mesh-networking surface — that surface belongs to the node agent, not to
+# a process supervising a single already-admitted job.
+spurd = { path = "../spurd" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

@@ -966,7 +966,7 @@ fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathB
 
 /// Reconstructs a job's cgroup path from its identity alone — usable even
 /// when the session descriptor that would normally carry it is unreadable.
-pub(crate) fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
+pub fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
     cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt)
 }
 
