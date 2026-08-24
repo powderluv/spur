@@ -27,6 +27,12 @@ pub const STEP_INTERACTIVE: StepId = 0xFFFF_FFFC;
 /// user `srun` steps are numbered below it (0, 1, 2, ...).
 pub const STEP_RESERVED_MIN: StepId = 0xFFFF_FFF0;
 
+/// Default for a step id deserialized from a payload written before this
+/// field existed — the batch step, since that was the only kind in flight.
+pub fn default_step_id() -> StepId {
+    STEP_BATCH
+}
+
 /// A step within a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStep {

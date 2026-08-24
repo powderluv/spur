@@ -420,6 +420,7 @@ service SlurmController {
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportStepdRecovery(StepdRecoveryRequest) returns (StepdRecoveryResponse);
 
   // Admission token management
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
@@ -470,6 +471,7 @@ service SlurmAgent {
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
+  rpc ProbeStepd(StepdProbeRequest) returns (StepdProbeResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
@@ -877,6 +879,20 @@ message RunningJobStatus {
 
 message HeartbeatResponse {}
 
+message StepdRecoveryRequest {
+  string hostname = 1;
+  uint32 job_id = 2;
+  uint32 run_attempt = 3;
+  string node_token = 4;
+  bool stale_descriptor = 5;
+}
+
+message StepdRecoveryResponse {
+  bool retained = 1;
+  bool fenced = 2;
+  string message = 3;
+}
+
 message PmixLocalProc {
   uint32 rank = 1;
   uint32 local_rank = 2;
@@ -970,6 +986,10 @@ message LaunchJobResponse {
 message AgentCancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;
+  // Epoch of the run being cancelled; 0 means unspecified (cancel whichever
+  // attempt is currently tracked). Guards a still-launching reservation
+  // release against a concurrent redispatch under the same job_id.
+  uint32 run_attempt = 3;
 }
 
 message AgentSuspendJobRequest {
@@ -980,6 +1000,15 @@ message AgentSuspendJobRequest {
 message NodeResourcesResponse {
   ResourceSet total = 1;
   ResourceAllocations used = 2;
+}
+
+message StepdProbeRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+}
+
+message StepdProbeResponse {
+  bool active = 1;
 }
 
 message ExecInJobRequest {
@@ -1268,6 +1297,7 @@ message RegisterJobAllocationRequest {
   string mpi = 10;
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
+  uint32 run_attempt = 13;
 }
 
 message RegisterJobAllocationResponse {}
