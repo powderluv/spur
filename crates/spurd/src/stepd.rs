@@ -20,6 +20,10 @@ pub struct StepdLaunchSpec {
     pub job_id: u32,
     #[serde(default = "spur_core::step::default_step_id")]
     pub step_id: spur_core::step::StepId,
+    /// The supervisor is a separate process and cannot read the agent's config,
+    /// so [cgroup] enforcement settings travel with the launch spec.
+    #[serde(default)]
+    pub cgroup: spur_core::config::CgroupConfig,
     pub script: String,
     pub work_dir: String,
     pub name: String,
@@ -129,6 +133,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: config.run_attempt,
+            cgroup: config.cgroup.clone(),
             capability: String::new(),
             allocation_only: false,
             pmix_multi_task: config.pmix_multi_task,
@@ -141,6 +146,7 @@ impl StepdLaunchSpec {
         crate::executor::JobLaunchConfig {
             job_id: self.job_id,
             run_attempt: self.run_attempt,
+            cgroup: self.cgroup,
             script: self.script,
             work_dir: self.work_dir,
             name: self.name,
@@ -340,6 +346,9 @@ const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 pub struct Stepd {
     job: Mutex<RunningJob>,
+    /// Owned by this supervisor: launch hands the cgroup over and nothing else
+    /// on the node tracks it, so teardown here is what removes it.
+    cgroup_path: Mutex<Option<PathBuf>>,
     snapshot: Arc<Mutex<StepdSnapshot>>,
     teardown_started: AtomicBool,
     launch_gate: Mutex<()>,
@@ -373,6 +382,7 @@ impl Stepd {
     ) -> Self {
         Self {
             job: Mutex::new(job),
+            cgroup_path: Mutex::new(None),
             snapshot: Arc::new(Mutex::new(StepdSnapshot {
                 job_id,
                 run_attempt,
@@ -391,8 +401,12 @@ impl Stepd {
         self.snapshot.lock().await.clone()
     }
 
+    pub async fn adopt_cgroup(&self, cgroup_path: Option<PathBuf>) {
+        *self.cgroup_path.lock().await = cgroup_path;
+    }
+
     async fn take_cgroup(&self) -> Option<PathBuf> {
-        self.job.lock().await.take_cgroup()
+        self.cgroup_path.lock().await.take()
     }
 
     pub async fn poll_completion(&self) -> io::Result<()> {
@@ -429,7 +443,7 @@ impl Stepd {
         let job = self.job.lock().await;
         job.kill_signal(signal).map_err(io::Error::other)?;
         if signal == nix::sys::signal::Signal::SIGKILL {
-            if let Some(cgroup_path) = job.cgroup_path() {
+            if let Some(cgroup_path) = self.cgroup_path.lock().await.as_deref() {
                 // Belt-and-suspenders: reaches descendants that detached
                 // from the signaled process group (e.g. via setsid).
                 if let Err(error) = crate::executor::cgroup_kill(cgroup_path) {
@@ -1050,21 +1064,24 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
-    let job = if launch_spec.allocation_only {
-        RunningJob::AllocationOnly
+    let (job, launched_cgroup) = if launch_spec.allocation_only {
+        (RunningJob::AllocationOnly, None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
-            Ok(result) => result.job,
+            Ok(result) => (result.job, result.cgroup_path),
             Err(error) => {
                 if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
-                    crate::container::cleanup_rootfs(job_id, rootfs_mode);
+                    crate::container::cleanup_rootfs(
+                        &crate::container::job_rootfs_base(job_id),
+                        rootfs_mode,
+                    );
                 }
                 crate::executor::cleanup_job_spool(job_id);
                 return Err(anyhow::anyhow!(error.to_string()));
             }
         }
     };
-    if let Some(cgroup_path) = job.cgroup_path() {
+    if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
         if let Err(error) = store.publish(&descriptor) {
             tracing::warn!(job_id, %error, "failed to republish runtime descriptor with cgroup path");
@@ -1077,14 +1094,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         step_id,
         runtime_environment,
     ));
+    session.adopt_cgroup(launched_cgroup).await;
     let capability = descriptor.capability.clone();
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     if let Some(cgroup) = session.take_cgroup().await {
-        crate::executor::cleanup_cgroup(&cgroup).await;
+        crate::executor::cleanup_cgroup(&cgroup);
     }
     if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
-        crate::container::cleanup_rootfs(job_id, rootfs_mode);
+        crate::container::cleanup_rootfs(&crate::container::job_rootfs_base(job_id), rootfs_mode);
     }
     crate::executor::cleanup_job_spool(job_id);
     if let Err(error) = result {

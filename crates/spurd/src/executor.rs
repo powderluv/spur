@@ -368,10 +368,7 @@ fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
 
 impl RunningJob {
     pub fn managed(child: tokio::process::Child) -> Self {
-        Self::Managed {
-            child,
-            cgroup_path: None,
-        }
+        Self::Managed { child }
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -447,22 +444,6 @@ impl RunningJob {
                 Ok(())
             }
             RunningJob::AllocationOnly => Ok(()),
-        }
-    }
-
-    pub fn take_cgroup(&mut self) -> Option<PathBuf> {
-        match self {
-            RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
-            RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
-            RunningJob::AllocationOnly => None,
-        }
-    }
-
-    pub fn cgroup_path(&self) -> Option<&Path> {
-        match self {
-            RunningJob::Managed { cgroup_path, .. } => cgroup_path.as_deref(),
-            RunningJob::Forked { cgroup_path, .. } => cgroup_path.as_deref(),
-            RunningJob::AllocationOnly => None,
         }
     }
 }

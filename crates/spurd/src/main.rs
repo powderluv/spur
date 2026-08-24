@@ -331,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
     // orphan. Reap it locally instead of leaving it running indefinitely.
     for descriptor in &stale_stepds {
         if !descriptor.cgroup_path.as_os_str().is_empty() {
-            crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
+            crate::executor::cleanup_cgroup(&descriptor.cgroup_path);
         }
     }
     // A corrupted descriptor has no cgroup_path to read, but the path is
@@ -340,8 +340,7 @@ async fn main() -> anyhow::Result<()> {
         crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
             job_id,
             run_attempt,
-        ))
-        .await;
+        ));
     }
     if !recovered_stepds.is_empty() {
         warn!(
