@@ -339,10 +339,8 @@ pub(crate) const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
 const STEPD_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-// A Stepd supervises exactly one step's process tree — the batch script for
-// STEP_BATCH today; an interactive shell (STEP_INTERACTIVE) or a numbered
-// srun step gets its own separate Stepd process in follow-up work, not a
-// second process hosted inside this one.
+// A Stepd supervises exactly one step's process tree; PTY/srun steps get
+// their own separate Stepd in follow-up work, not a slot in this one.
 
 pub struct Stepd {
     job: Mutex<RunningJob>,

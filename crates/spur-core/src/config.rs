@@ -825,7 +825,13 @@ impl AuthConfig {
     }
 
     pub fn has_jwt_key(&self) -> bool {
-        self.resolved_jwt_key().ok().flatten().is_some()
+        match self.resolved_jwt_key() {
+            Ok(key) => key.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to resolve jwt key; treating as not configured");
+                false
+            }
+        }
     }
 }
 
