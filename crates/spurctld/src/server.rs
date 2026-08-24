@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -31,6 +31,7 @@ use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
+const STEPD_RECOVERY_COHORT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Resolve the comm address for an agent registration.
 ///
@@ -129,6 +130,10 @@ pub struct ControllerService {
     /// verification of every outstanding node token (7-day TTL), silently
     /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
     jwt_key: String,
+    /// Stepd agents need an explicit signing secret. The built-in
+    /// compatibility fallback is public and cannot establish node identity.
+    node_identity_key_configured: bool,
+    incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), std::time::Instant>>,
 }
 
 struct LeaderProxy {
@@ -196,9 +201,11 @@ impl LeaderProxy {
 /// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
 /// `reconfigure` (see the field doc). Falls back to a shared default so
 /// key-less dev clusters interoperate.
-fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
-    if let Some(key) = &config.auth.jwt_key {
-        return key.clone();
+pub(crate) fn resolve_startup_jwt_key(
+    config: &spur_core::config::SlurmConfig,
+) -> anyhow::Result<String> {
+    if let Some(key) = config.auth.resolved_jwt_key()? {
+        return Ok(key);
     }
     // Token admission signs/verifies node tokens with this key. A well-known
     // default is trivially forgeable by anyone who can reach the controller.
@@ -208,10 +215,10 @@ fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
     ) {
         warn!(
             "admission.mode=Token but auth.jwt_key is unset: node tokens are signed with a \
-             well-known default key and are forgeable. Set auth.jwt_key to a secret value."
+             well-known default key and are forgeable. Set auth.jwt_key or auth.jwt_key_file."
         );
     }
-    "spur-default-key".to_string()
+    Ok("spur-default-key".to_string())
 }
 
 impl ControllerService {
@@ -227,6 +234,161 @@ impl ControllerService {
         }
 
         Err(self.not_leader_status())
+    }
+
+    async fn stepd_recovery_cohort_expired(&self, job_id: u32, run_attempt: u32) -> bool {
+        let mut incomplete = self.incomplete_stepd_recoveries.lock().await;
+        // A cohort whose reporter stops retrying is never cleared by the normal
+        // path; sweep entries stuck well past the grace period so this map
+        // can't grow without bound.
+        incomplete.retain(|_, first_seen| first_seen.elapsed() < STEPD_RECOVERY_COHORT_GRACE * 10);
+        let first_seen = incomplete
+            .entry((job_id, run_attempt))
+            .or_insert_with(std::time::Instant::now);
+        first_seen.elapsed() >= STEPD_RECOVERY_COHORT_GRACE
+    }
+
+    async fn clear_stepd_recovery_cohort(&self, job_id: u32, run_attempt: u32) {
+        self.incomplete_stepd_recoveries
+            .lock()
+            .await
+            .remove(&(job_id, run_attempt));
+    }
+
+    async fn probe_stepd_recovery(
+        &self,
+        hostname: &str,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Result<StepdRecoveryProbe, Status> {
+        let Some(job) = self.cluster.get_job(job_id) else {
+            return Ok(StepdRecoveryProbe::Stale);
+        };
+        if !job.state.is_active() || job.run_attempt != run_attempt {
+            return Ok(StepdRecoveryProbe::Stale);
+        }
+        if !job.allocated_nodes.iter().any(|node| node == hostname) {
+            return Err(Status::permission_denied(
+                "runtime recovery reporter is not allocated to this job",
+            ));
+        }
+
+        let expected_nodes = job.allocated_nodes.clone();
+        let mut missing = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
+        let mut handle_to_node = HashMap::new();
+        for node_name in &expected_nodes {
+            let Some(node) = self.cluster.get_node(node_name) else {
+                missing.push(node_name.clone());
+                continue;
+            };
+            let endpoint = match node_comm_http_url(&node, node_name) {
+                Ok(endpoint) => endpoint,
+                Err(_) => {
+                    missing.push(node_name.clone());
+                    continue;
+                }
+            };
+            let node_name = node_name.clone();
+            let probed_node = node_name.clone();
+            let handle = set.spawn(async move {
+                match crate::agent_client::connect(endpoint).await {
+                    Ok(mut client) => client
+                        .probe_stepd(StepdProbeRequest {
+                            job_id,
+                            run_attempt,
+                        })
+                        .await
+                        .map(|response| response.into_inner().active)
+                        .unwrap_or_else(|error| {
+                            warn!(job_id, run_attempt, node = %probed_node, %error, "runtime recovery probe RPC failed");
+                            false
+                        }),
+                    Err(error) => {
+                        warn!(job_id, run_attempt, node = %probed_node, %error, "runtime recovery probe failed to connect to agent");
+                        false
+                    }
+                }
+            });
+            handle_to_node.insert(handle.id(), node_name);
+        }
+        while let Some(result) = set.join_next_with_id().await {
+            match result {
+                Ok((id, active)) => {
+                    if !active {
+                        if let Some(node_name) = handle_to_node.remove(&id) {
+                            missing.push(node_name);
+                        }
+                    }
+                }
+                // A probe task panicking tells us nothing about the node's
+                // liveness; treat it the same as a failed probe rather than
+                // silently counting the node as confirmed-active.
+                Err(error) => {
+                    if let Some(node_name) = handle_to_node.remove(&error.id()) {
+                        missing.push(node_name);
+                    }
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(StepdRecoveryProbe::Retained);
+        }
+        Ok(StepdRecoveryProbe::Incomplete {
+            expected_nodes,
+            missing,
+        })
+    }
+
+    async fn fence_stepd_recovery(&self, job_id: u32, run_attempt: u32) -> Result<bool, Status> {
+        let Some(job) = self.cluster.get_job(job_id) else {
+            return Ok(false);
+        };
+        if !job.state.is_active() || job.run_attempt != run_attempt {
+            return Ok(false);
+        }
+        match self
+            .cluster
+            .preempt_job(job_id, spur_core::partition::PreemptMode::Requeue)
+        {
+            Ok(crate::cluster::PreemptOutcome::Killed) => {
+                crate::scheduler_loop::send_cancel_to_agents(&self.cluster, &job, 0).await;
+                Ok(true)
+            }
+            Ok(crate::cluster::PreemptOutcome::Suspended) => Err(Status::internal(
+                "runtime recovery fence suspended instead of requeuing the job",
+            )),
+            Err(error) => Err(Status::internal(format!(
+                "failed to fence incomplete runtime recovery: {error}"
+            ))),
+        }
+    }
+
+    fn authorize_stepd_recovery_report(
+        &self,
+        hostname: &str,
+        node_token: &str,
+    ) -> Result<(), Status> {
+        if !self.node_identity_key_configured {
+            return Err(Status::failed_precondition(
+                "stepd recovery requires [auth] jwt_key or jwt_key_file",
+            ));
+        }
+        if node_token.is_empty() {
+            return Err(Status::unauthenticated("node token required"));
+        }
+        let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
+            .map_err(|error| Status::unauthenticated(error.to_string()))?;
+        if identity.hostname != hostname {
+            return Err(Status::permission_denied("node token hostname mismatch"));
+        }
+        if self.cluster.get_node(hostname).is_none() {
+            return Err(Status::not_found(format!(
+                "node {hostname} is not registered"
+            )));
+        }
+        Ok(())
     }
 
     /// Re-send a cancel to a node still holding an allocation the controller no
@@ -256,6 +418,7 @@ impl ControllerService {
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
+                    0,
                     std::slice::from_ref(&node),
                     0,
                 )
@@ -636,31 +799,41 @@ impl ControllerService {
         }
     }
 
-    /// Validate an admission token if token mode is enabled.
-    /// Returns the node_token JWT to include in the registration response,
-    /// or an empty string if admission mode is open.
+    /// Validate an admission token if token mode is enabled and mint a node
+    /// credential when the deployment configured a non-public signing key.
     #[allow(clippy::result_large_err)]
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
+        if matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
+            if join_token.is_empty() {
+                return Err(Status::unauthenticated("admission token required"));
+            }
+
+            let (token_id, secret) = spur_core::admission::parse_token(join_token)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+            let token_store = self.cluster.get_tokens();
+            spur_core::admission::validate_token(token_id, secret, &token_store)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
+        }
+
+        if !self.node_identity_key_configured {
             return Ok(String::new());
         }
-
-        if join_token.is_empty() {
-            return Err(Status::unauthenticated("admission token required"));
-        }
-
-        let (token_id, secret) = spur_core::admission::parse_token(join_token)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
-
-        let token_store = self.cluster.get_tokens();
-        spur_core::admission::validate_token(token_id, secret, &token_store)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
 
         spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
     }
+}
+
+enum StepdRecoveryProbe {
+    Stale,
+    Retained,
+    Incomplete {
+        expected_nodes: Vec<String>,
+        missing: Vec<String>,
+    },
 }
 
 /// Resolve a user to the (namespace, ServiceAccount) its scoped kubeconfig must be bound to.
@@ -1830,9 +2003,14 @@ impl SlurmController for ControllerService {
                         if !missing.is_empty() {
                             let cluster = self.cluster.clone();
                             let job_id = req.job_id;
+                            let run_attempt = job.run_attempt;
                             tokio::spawn(async move {
                                 crate::scheduler_loop::cancel_job_on_nodes(
-                                    &cluster, job_id, &missing, 15,
+                                    &cluster,
+                                    job_id,
+                                    run_attempt,
+                                    &missing,
+                                    15,
                                 )
                                 .await;
                             });
@@ -1928,6 +2106,117 @@ impl SlurmController for ControllerService {
                 "node {} not found — is the node registered?",
                 req.hostname
             )))
+        }
+    }
+
+    async fn report_stepd_recovery(
+        &self,
+        request: Request<StepdRecoveryRequest>,
+    ) -> Result<Response<StepdRecoveryResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let fwd = Self::forward_request(request);
+                    return client.report_stepd_recovery(fwd).await;
+                }
+                Err(error) => {
+                    warn!("failed to forward runtime recovery report to leader: {error}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let request = request.into_inner();
+        self.authorize_stepd_recovery_report(&request.hostname, &request.node_token)?;
+
+        let probe = self
+            .probe_stepd_recovery(&request.hostname, request.job_id, request.run_attempt)
+            .await?;
+
+        if request.stale_descriptor {
+            match probe {
+                StepdRecoveryProbe::Stale => {
+                    self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    return Ok(Response::new(StepdRecoveryResponse {
+                        retained: false,
+                        fenced: false,
+                        message: "stepd belongs to an inactive or superseded run".into(),
+                    }));
+                }
+                StepdRecoveryProbe::Retained | StepdRecoveryProbe::Incomplete { .. } => {
+                    self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    let fenced = self
+                        .fence_stepd_recovery(request.job_id, request.run_attempt)
+                        .await?;
+                    return Ok(Response::new(StepdRecoveryResponse {
+                        retained: false,
+                        fenced,
+                        message: "stepd descriptor has no live supervisor".into(),
+                    }));
+                }
+            }
+        }
+
+        match probe {
+            StepdRecoveryProbe::Stale => {
+                self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                    .await;
+                Ok(Response::new(StepdRecoveryResponse {
+                    retained: false,
+                    fenced: false,
+                    message: "stepd belongs to an inactive or superseded run".into(),
+                }))
+            }
+            StepdRecoveryProbe::Retained => {
+                self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                    .await;
+                Ok(Response::new(StepdRecoveryResponse {
+                    retained: true,
+                    fenced: false,
+                    message: String::new(),
+                }))
+            }
+            StepdRecoveryProbe::Incomplete {
+                expected_nodes,
+                missing,
+            } => {
+                if self
+                    .stepd_recovery_cohort_expired(request.job_id, request.run_attempt)
+                    .await
+                {
+                    let fenced = self
+                        .fence_stepd_recovery(request.job_id, request.run_attempt)
+                        .await?;
+                    self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    return Ok(Response::new(StepdRecoveryResponse {
+                        retained: false,
+                        fenced,
+                        message: "runtime recovery cohort did not become available before its grace period elapsed".into(),
+                    }));
+                }
+                let message = format!(
+                    "runtime recovery cohort is not yet available: missing {} of {} participants ({})",
+                    missing.len(),
+                    expected_nodes.len(),
+                    missing.join(",")
+                );
+                warn!(
+                    job_id = request.job_id,
+                    run_attempt = request.run_attempt,
+                    reporter = %request.hostname,
+                    missing = ?missing,
+                    "deferring incomplete runtime recovery probe until the cohort is available"
+                );
+                Ok(Response::new(StepdRecoveryResponse {
+                    retained: true,
+                    fenced: false,
+                    message,
+                }))
+            }
         }
     }
 
@@ -3618,6 +3907,7 @@ impl SlurmController for ControllerService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: SocketAddr,
     cluster: Arc<ClusterManager>,
@@ -3626,6 +3916,7 @@ pub async fn serve(
     sched_stats: Arc<SchedStatsCollector>,
     accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
+    jwt_key: String,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -3642,7 +3933,7 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
-    let jwt_key = resolve_startup_jwt_key(&cluster.config());
+    let node_identity_key_configured = cluster.config().auth.has_jwt_key();
     let auth_mode = cluster.config().auth.mode;
     // Unlike node admission, an unset key here must reject every credential, never fall back
     // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
@@ -3657,6 +3948,8 @@ pub async fn serve(
         sched_stats: sched_stats.clone(),
         control_plane_replicas,
         jwt_key,
+        node_identity_key_configured,
+        incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -5172,6 +5465,8 @@ mod tests {
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            node_identity_key_configured: false,
+            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -5760,7 +6055,7 @@ mod tests {
         cluster.set_raft(handle.raft);
 
         // The controller captures the signing key exactly here, at startup.
-        let startup_key = resolve_startup_jwt_key(&cluster.config());
+        let startup_key = resolve_startup_jwt_key(&cluster.config()).unwrap();
         assert_eq!(startup_key, "old-secret");
         let token = generate_node_token("node-1", startup_key.as_bytes()).unwrap();
 
@@ -5842,6 +6137,8 @@ mod tests {
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            node_identity_key_configured: false,
+            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
         }
     }
 
