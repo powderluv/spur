@@ -8,7 +8,10 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
-use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus};
+use spur_proto::proto::{
+    RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus, StepdRecoveryRequest,
+    StepdRecoveryResponse,
+};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -101,6 +104,14 @@ impl NodeReporter {
             .context("failed to connect to spurctld for registration")?;
         let mut client = spur_proto::controller_client(channel);
 
+        let stepd = std::env::var("SPUR_STEPD")
+            .ok()
+            .is_some_and(|value| value == "1");
+        let mut labels = self.labels.clone();
+        if stepd {
+            labels.insert("spur.stepd".into(), "1".into());
+        }
+
         let resp = client
             .register_agent(RegisterAgentRequest {
                 hostname: self.hostname.clone(),
@@ -109,7 +120,7 @@ impl NodeReporter {
                 address: self.node_address.ip.clone(),
                 port: self.node_address.port as u32,
                 wg_pubkey: self.wg_pubkey(),
-                labels: self.labels.clone(),
+                labels,
                 join_token: self.join_token.clone(),
             })
             .await
@@ -117,6 +128,7 @@ impl NodeReporter {
 
         let inner = resp.into_inner();
         if inner.accepted {
+            require_runtime_node_token(stepd, &inner.node_token)?;
             if !inner.node_token.is_empty() {
                 *self.node_token.write().unwrap() = inner.node_token;
             }
@@ -147,6 +159,34 @@ impl NodeReporter {
 
         info!("deregistered from controller");
         Ok(())
+    }
+
+    pub async fn report_stepd_recovery(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        stale_descriptor: bool,
+    ) -> anyhow::Result<StepdRecoveryResponse> {
+        let channel = spur_client::connect_channel(&self.controller_addr)
+            .await
+            .context("failed to connect to spurctld for runtime recovery")?;
+        let mut client = spur_proto::controller_client(channel);
+        let node_token = self
+            .node_token
+            .read()
+            .map_err(|_| anyhow::anyhow!("runtime recovery node token lock poisoned"))?
+            .clone();
+        let response = client
+            .report_stepd_recovery(StepdRecoveryRequest {
+                hostname: self.hostname.clone(),
+                job_id,
+                run_attempt,
+                node_token,
+                stale_descriptor,
+            })
+            .await
+            .context("runtime recovery report failed")?;
+        Ok(response.into_inner())
     }
 
     /// Periodic heartbeat loop.
@@ -217,6 +257,15 @@ impl NodeReporter {
 /// this the agent would heartbeat into the same rejection forever.
 fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
+}
+
+fn require_runtime_node_token(stepd: bool, node_token: &str) -> anyhow::Result<()> {
+    if stepd && node_token.is_empty() {
+        anyhow::bail!(
+            "Stepd requires [auth] jwt_key or jwt_key_file so this agent can prove its node identity"
+        );
+    }
+    Ok(())
 }
 
 /// Discover local node resources from sysfs / /proc + device registry.
@@ -592,6 +641,13 @@ mod tests {
             "node token required"
         )));
         assert!(!should_reregister(&tonic::Status::internal("boom")));
+    }
+
+    #[test]
+    fn stepd_registration_requires_a_node_credential() {
+        assert!(require_runtime_node_token(false, "").is_ok());
+        assert!(require_runtime_node_token(true, "node-credential").is_ok());
+        assert!(require_runtime_node_token(true, "").is_err());
     }
 
     #[test]
