@@ -4133,11 +4133,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         },
         argv: spec.argv,
         script_args: spec.script_args,
-        work_dir: if spec.work_dir.is_empty() {
-            "/tmp".into()
-        } else {
-            spec.work_dir
-        },
+        // Left empty rather than defaulted here: a flat, shared "/tmp" bakes a
+        // collision-prone anchor for relative output paths into every
+        // work_dir-less job. The agent resolves an empty work_dir into a
+        // per-job scratch directory once the job's actual run_attempt is known.
+        work_dir: spec.work_dir,
         stdout_path: if spec.stdout_path.is_empty() {
             None
         } else {

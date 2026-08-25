@@ -3255,11 +3255,11 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let work_dir = if spec.work_dir.is_empty() {
-            spur_core::job::DEFAULT_WORK_DIR.to_string()
-        } else {
-            spec.work_dir.clone()
-        };
+        // Left empty rather than defaulted to a flat, shared DEFAULT_WORK_DIR
+        // here: `executor::launch_job` resolves an empty work_dir into a
+        // per-job scratch directory once run_attempt is known, avoiding a
+        // collision-prone shared anchor for relative output paths.
+        let work_dir = spec.work_dir.clone();
 
         let script =
             if batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout {

@@ -518,17 +518,8 @@ async fn spawn_job_process(
     )?);
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
-    // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
-    // the job can still run; absolute output paths in the spec are unaffected.
-    let effective_work_dir: String = if create_dir_as_user(Path::new(work_dir), uid, gid) {
-        work_dir.to_string()
-    } else {
-        warn!(
-            job_id,
-            work_dir, "work_dir unavailable on this node, using /tmp"
-        );
-        "/tmp".to_string()
-    };
+    // node); falls back to a per-job scratch directory when it can't be created here.
+    let effective_work_dir = resolve_effective_work_dir(job_id, run_attempt, work_dir, uid, gid);
     let work_dir = effective_work_dir.as_str();
 
     // The directive is per job, so it comes from the job's environment. Reading
@@ -1718,6 +1709,41 @@ fn open_job_output(
     }
 }
 
+/// Resolves the work_dir a job actually runs in on this node. Prefers the
+/// submitted path; if that can't be created here (e.g. it's under another
+/// user's home), falls back to a per-job scratch directory rather than the
+/// shared /tmp root directly — a relative output path (spur-<job_id>.out)
+/// landing straight in /tmp can collide with another job's or user's file of
+/// the same name and fail with a permission error the submitter can't
+/// diagnose. Only falls all the way back to bare /tmp if even that per-job
+/// directory can't be created.
+fn resolve_effective_work_dir(
+    job_id: JobId,
+    run_attempt: u32,
+    work_dir: &str,
+    uid: u32,
+    gid: u32,
+) -> String {
+    // `create_dir_all("")` is a silent no-op success (no path components to
+    // create), so an empty work_dir must be checked explicitly — otherwise
+    // it would be treated as already resolved instead of falling through to
+    // the scratch-dir default below.
+    if !work_dir.is_empty() && create_dir_as_user(Path::new(work_dir), uid, gid) {
+        return work_dir.to_string();
+    }
+    let scratch_dir = std::env::temp_dir().join(format!("spur-job_{job_id}_{run_attempt}"));
+    if create_dir_as_user(&scratch_dir, uid, gid) {
+        warn!(job_id, work_dir, scratch_dir = %scratch_dir.display(),
+            "work_dir unavailable on this node, using a per-job scratch directory");
+        return scratch_dir.to_string_lossy().into_owned();
+    }
+    warn!(
+        job_id,
+        work_dir, "work_dir and per-job scratch directory both unavailable, using /tmp"
+    );
+    "/tmp".to_string()
+}
+
 /// Create `dir` and any missing parents as the submitting user (forking to drop
 /// privilege when spurd is root), so directory creation resolves symlinks and
 /// permissions with the user's authority. Returns whether the tree now exists.
@@ -2719,6 +2745,52 @@ mod tests {
         assert!(nested.is_dir());
         // Idempotent over an existing tree.
         assert!(create_dir_as_user(&nested, uid, gid));
+    }
+
+    #[test]
+    fn resolve_effective_work_dir_uses_the_submitted_path_when_creatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().join("job-work-dir");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let resolved = resolve_effective_work_dir(1, 1, &work_dir.to_string_lossy(), uid, gid);
+
+        assert_eq!(resolved, work_dir.to_string_lossy());
+        assert!(work_dir.is_dir());
+    }
+
+    #[test]
+    fn resolve_effective_work_dir_treats_empty_as_unset_not_already_resolved() {
+        // create_dir_all("") is a silent no-op success, so an empty work_dir
+        // must not be mistaken for an already-usable path.
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let resolved = resolve_effective_work_dir(9001, 2, "", uid, gid);
+
+        let expected = std::env::temp_dir().join("spur-job_9001_2");
+        assert_eq!(resolved, expected.to_string_lossy());
+        assert!(expected.is_dir());
+        std::fs::remove_dir(&expected).ok();
+    }
+
+    #[test]
+    fn resolve_effective_work_dir_falls_back_to_a_scoped_scratch_dir_not_bare_tmp() {
+        // A path nested under a plain file can never be created — deterministic,
+        // uid-independent way to force the fallback branch.
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let unusable_work_dir = blocker.path().join("subdir");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let resolved =
+            resolve_effective_work_dir(4242, 3, &unusable_work_dir.to_string_lossy(), uid, gid);
+
+        let expected = std::env::temp_dir().join("spur-job_4242_3");
+        assert_eq!(resolved, expected.to_string_lossy());
+        assert!(expected.is_dir(), "scratch dir must actually be created");
+        std::fs::remove_dir(&expected).ok();
     }
 
     #[test]
