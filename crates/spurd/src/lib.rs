@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Library half of the `spurd` node agent. Split out so `spur-stepd` (the
-//! per-job supervisor binary) can reuse `executor`/`container`/`stepd`
-//! without linking spurd's controller-RPC, k0s, or mesh-networking surface.
+//! per-job supervisor binary) can reuse `executor`/`container`/`stepd` as a
+//! separate process that never runs spurd's controller-RPC/k0s/mesh code —
+//! a runtime isolation boundary; this crate isn't split further, so
+//! spur-stepd still depends on (without invoking) that surface at link time.
 
 pub mod agent_server;
 pub mod auth_middleware;

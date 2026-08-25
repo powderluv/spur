@@ -1242,12 +1242,8 @@ pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
     std::fs::write(cgroup_path.join("cgroup.kill"), b"1")
 }
 
-/// Signals every pid currently tracked by the cgroup. Unlike `cgroup_kill`
-/// (SIGKILL-only), this works for any signal — the cgroup's `cgroup.procs`
-/// membership is the canonical kill-target set, reaching descendants that
-/// escaped the job's process group (e.g. via `setsid`) the way a plain
-/// `kill(-pgid)` cannot. Returns the number of pids signaled; `Ok(0)` means
-/// the cgroup has no tracked pids (job already exited, or no cgroup at all).
+/// Signals every pid in the cgroup with any signal (unlike `cgroup_kill`,
+/// SIGKILL-only). Returns the count signaled; `Ok(0)` means no tracked pids.
 pub fn cgroup_signal(cgroup_path: &Path, sig: Signal) -> std::io::Result<usize> {
     let pids = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
     let mut signaled = 0;
@@ -1709,14 +1705,10 @@ fn open_job_output(
     }
 }
 
-/// Resolves the work_dir a job actually runs in on this node. Prefers the
-/// submitted path; if that can't be created here (e.g. it's under another
-/// user's home), falls back to a per-job scratch directory rather than the
-/// shared /tmp root directly — a relative output path (spur-<job_id>.out)
-/// landing straight in /tmp can collide with another job's or user's file of
-/// the same name and fail with a permission error the submitter can't
-/// diagnose. Only falls all the way back to bare /tmp if even that per-job
-/// directory can't be created.
+/// Resolves the work_dir a job runs in. Falls back to a per-job scratch
+/// directory (not shared /tmp directly) if the submitted path can't be
+/// created here, since a relative output path anchored to bare /tmp can
+/// collide with another job's or user's file of the same name.
 fn resolve_effective_work_dir(
     job_id: JobId,
     run_attempt: u32,

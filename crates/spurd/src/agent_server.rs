@@ -51,12 +51,8 @@ struct StepdLaunchOptions {
     plugstack_path: String,
 }
 
-/// `spurstepd` is a separate binary from `spurd` (not a subcommand of it) —
-/// deliberately: the per-job supervisor sits beside untrusted job execution
-/// for a job's whole lifetime, while spurd terminates network RPCs and does
-/// cluster-admin work (k0s); a shared binary would give either role's
-/// compromise the other's dependency surface. It's expected to be installed
-/// alongside spurd, so look there first before falling back to PATH.
+/// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
+/// fallback resolves via `execv` (CWD-relative only, no $PATH search).
 fn resolve_stepd_executable() -> std::path::PathBuf {
     let co_located = std::env::current_exe()
         .ok()
@@ -67,13 +63,10 @@ fn resolve_stepd_executable() -> std::path::PathBuf {
     }
 }
 
-/// Detaches `spurstepd` via the same double-fork+setsid pattern Slurm's
-/// slurmd uses for slurmstepd: the immediate child forks again, `setsid()`s
-/// in the grandchild, then execs; the immediate child exits right away so
-/// the grandchild reparents to init and outlives spurd's own
-/// restarts/crashes. `Command::spawn`'s return value would only be the
-/// immediately-exiting intermediate child, so the grandchild reports its
-/// real pid back over a pipe before exec.
+/// Double-fork+setsid detach (Slurm's `slurmstepd` spawn pattern): the
+/// grandchild reports its real pid over a pipe before exec, since
+/// `Command::spawn`'s return is just the immediately-exiting intermediate
+/// child that lets the grandchild reparent to init.
 fn spawn_stepd_process(
     executable: &std::path::Path,
     args: &[std::path::PathBuf],
@@ -109,13 +102,20 @@ fn spawn_stepd_process(
                     let pid = std::process::id().to_ne_bytes();
                     unsafe {
                         libc::write(ready_w, pid.as_ptr().cast(), pid.len());
-                        libc::close(ready_w);
+                        // FD_CLOEXEC, not an immediate close: a successful
+                        // execv closes this for us (EOF, no error byte);
+                        // only a failed execv falls through to report one.
+                        libc::fcntl(ready_w, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
                     let _ = nix::unistd::execv(&c_path, &c_arg_refs);
+                    unsafe {
+                        libc::write(ready_w, [1u8].as_ptr().cast(), 1);
+                        libc::close(ready_w);
+                    }
                     unsafe { libc::_exit(127) };
                 }
-                // Intermediate child: exit immediately so the grandchild is
-                // orphaned to init rather than waiting on this process.
+                // Intermediate child (or a failed second fork, folded into
+                // the same arm): exit so the grandchild orphans to init.
                 _ => unsafe { libc::_exit(0) },
             }
         }
@@ -139,9 +139,34 @@ fn spawn_stepd_process(
                     "spurstepd exited before reporting its pid",
                 ));
             }
-            Ok(u32::from_ne_bytes(buf))
+            let pid = u32::from_ne_bytes(buf);
+            if execv_reported_failure(&pipe_r) {
+                return Err(std::io::Error::other(format!(
+                    "spurstepd (pid {pid}) failed to exec {}",
+                    executable.display()
+                )));
+            }
+            Ok(pid)
         }
     }
+}
+
+/// After the pid handoff, briefly polls the same pipe for the grandchild's
+/// exec-failure byte (written only if `execv` returned) instead of waiting
+/// out the full readiness timeout — a successful exec closes the write end
+/// via FD_CLOEXEC with no byte sent, so this returns quickly either way.
+fn execv_reported_failure(pipe_r: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: pipe_r.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    matches!(nix::unistd::read(pipe_r, &mut byte), Ok(1))
 }
 
 async fn launch_stepd(
@@ -6805,6 +6830,52 @@ mod tests {
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
+    }
+
+    #[test]
+    fn spawn_stepd_process_fails_fast_on_a_missing_executable() {
+        let missing = std::path::PathBuf::from("/nonexistent/spur-test-missing-binary");
+        let args: Vec<std::path::PathBuf> = Vec::new();
+
+        let started = std::time::Instant::now();
+        let error = spawn_stepd_process(&missing, &args)
+            .expect_err("a missing exec target must be reported as an error");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "must fail fast via the exec-error pipe, not the full readiness timeout"
+        );
+        assert!(error.to_string().contains("failed to exec"));
+    }
+
+    #[tokio::test]
+    async fn stop_stepd_process_is_a_noop_against_a_genuinely_stale_pid() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        let start_ticks =
+            crate::stepd::process_start_ticks(pid).expect("read start ticks before it exits");
+        child
+            .wait()
+            .expect("reap the process so its pid is free to be stale");
+
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            1,
+            1,
+            spur_core::step::STEP_BATCH,
+            pid,
+            start_ticks,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        assert_eq!(
+            crate::stepd::stepd_liveness(&descriptor).expect("liveness check"),
+            crate::stepd::StepdLiveness::Stale,
+            "an exited pid with its old start-ticks recorded must read as stale"
+        );
+        assert!(stop_stepd_process(&descriptor).await.is_ok());
     }
 
     #[test]

@@ -439,10 +439,11 @@ impl Stepd {
             )
         })?;
         let job = self.job.lock().await;
-        // Cgroup membership is the canonical kill-target set — it reaches
-        // descendants that detached from the job's process group (e.g. via
-        // setsid), which a plain process-group signal cannot. Fall back to
-        // process-group signaling only when there's no cgroup to read.
+        // Cgroup membership is the canonical kill-target set, reaching
+        // descendants a plain process-group signal can't. Falls back
+        // whenever it didn't reach anyone: no cgroup, an unreadable
+        // cgroup.procs, or a cgroup that exists but has no pid in it yet
+        // (the launch-vs-move_to_cgroup race).
         let cgroup_result = self
             .cgroup_path
             .lock()
@@ -450,12 +451,12 @@ impl Stepd {
             .as_deref()
             .map(|path| crate::executor::cgroup_signal(path, signal));
         match cgroup_result {
-            None => job.kill_signal(signal).map_err(io::Error::other)?,
+            Some(Ok(count)) if count > 0 => {}
             Some(Err(error)) => {
                 tracing::warn!(%error, "cgroup.procs signal failed, falling back to process group");
                 job.kill_signal(signal).map_err(io::Error::other)?;
             }
-            Some(Ok(_)) => {}
+            _ => job.kill_signal(signal).map_err(io::Error::other)?,
         }
         if signal == nix::sys::signal::Signal::SIGKILL {
             if let Some(cgroup_path) = self.cgroup_path.lock().await.as_deref() {
@@ -481,7 +482,7 @@ impl Stepd {
             .await
             .as_deref()
             .and_then(|path| crate::executor::cgroup_signal(path, sigterm).ok())
-            .is_some();
+            .is_some_and(|count| count > 0);
         if !cgroup_signaled {
             if let Err(error) = job.kill_signal(sigterm) {
                 tracing::warn!(%error, "failed to terminate stepd process during teardown");
@@ -1781,6 +1782,80 @@ mod tests {
             b"1",
             "SIGKILL must escalate through cgroup.kill"
         );
+    }
+
+    #[tokio::test]
+    async fn signal_reaches_a_pid_only_visible_via_cgroup_procs() {
+        // A process outside the job's own process group — reachable only if
+        // cgroup.procs is genuinely used as the primary kill-target set,
+        // not just as a SIGKILL backstop.
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        let mut side_child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn side child");
+        let side_pid = side_child.id().expect("side child pid");
+        std::fs::write(cgroup.path().join("cgroup.procs"), side_pid.to_string())
+            .expect("seed cgroup.procs");
+
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        command.process_group(0);
+        let child = command.spawn().expect("spawn managed job");
+        let job = RunningJob::Managed {
+            child,
+            cgroup_path: Some(cgroup.path().to_path_buf()),
+        };
+        let session = Stepd::new(job, 84, 1, spur_core::step::STEP_BATCH);
+
+        session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+
+        use std::os::unix::process::ExitStatusExt;
+        let status = side_child.wait().await.expect("wait for side child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "a pid only reachable via cgroup.procs must be signaled directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_falls_back_to_process_group_when_cgroup_has_no_tracked_pids() {
+        // Regression test: cgroup_signal returning Ok(0) (an empty
+        // cgroup.procs) must not be mistaken for a delivered signal.
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cgroup.path().join("cgroup.procs"), b"").expect("seed empty cgroup.procs");
+
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        command.process_group(0);
+        let child = command.spawn().expect("spawn managed job");
+        let job = RunningJob::Managed {
+            child,
+            cgroup_path: Some(cgroup.path().to_path_buf()),
+        };
+        let session = Stepd::new(job, 85, 1, spur_core::step::STEP_BATCH);
+
+        session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+
+        let mut job = session.job.lock().await;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(Some(status)) = job.try_wait() {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("job must die via the process-group fallback");
+        assert_eq!(status.1, libc::SIGTERM, "must have died from SIGTERM");
     }
 
     #[tokio::test]
