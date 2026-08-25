@@ -439,11 +439,28 @@ impl Stepd {
             )
         })?;
         let job = self.job.lock().await;
-        job.kill_signal(signal).map_err(io::Error::other)?;
+        // Cgroup membership is the canonical kill-target set — it reaches
+        // descendants that detached from the job's process group (e.g. via
+        // setsid), which a plain process-group signal cannot. Fall back to
+        // process-group signaling only when there's no cgroup to read.
+        let cgroup_result = self
+            .cgroup_path
+            .lock()
+            .await
+            .as_deref()
+            .map(|path| crate::executor::cgroup_signal(path, signal));
+        match cgroup_result {
+            None => job.kill_signal(signal).map_err(io::Error::other)?,
+            Some(Err(error)) => {
+                tracing::warn!(%error, "cgroup.procs signal failed, falling back to process group");
+                job.kill_signal(signal).map_err(io::Error::other)?;
+            }
+            Some(Ok(_)) => {}
+        }
         if signal == nix::sys::signal::Signal::SIGKILL {
             if let Some(cgroup_path) = self.cgroup_path.lock().await.as_deref() {
-                // Belt-and-suspenders: reaches descendants that detached
-                // from the signaled process group (e.g. via setsid).
+                // Atomic kernel-level SIGKILL, reaching anything a
+                // cgroup.procs snapshot could have raced past.
                 if let Err(error) = crate::executor::cgroup_kill(cgroup_path) {
                     tracing::warn!(%error, path = %cgroup_path.display(), "cgroup.kill failed");
                 }
@@ -457,8 +474,18 @@ impl Stepd {
         self.teardown_started.store(true, Ordering::Release);
         drop(launch_gate);
         let job = self.job.lock().await;
-        if let Err(error) = job.kill_signal(nix::sys::signal::Signal::SIGTERM) {
-            tracing::warn!(%error, "failed to terminate stepd process during teardown");
+        let sigterm = nix::sys::signal::Signal::SIGTERM;
+        let cgroup_signaled = self
+            .cgroup_path
+            .lock()
+            .await
+            .as_deref()
+            .and_then(|path| crate::executor::cgroup_signal(path, sigterm).ok())
+            .is_some();
+        if !cgroup_signaled {
+            if let Err(error) = job.kill_signal(sigterm) {
+                tracing::warn!(%error, "failed to terminate stepd process during teardown");
+            }
         }
     }
 }

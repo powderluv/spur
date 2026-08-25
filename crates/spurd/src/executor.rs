@@ -1251,6 +1251,25 @@ pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
     std::fs::write(cgroup_path.join("cgroup.kill"), b"1")
 }
 
+/// Signals every pid currently tracked by the cgroup. Unlike `cgroup_kill`
+/// (SIGKILL-only), this works for any signal — the cgroup's `cgroup.procs`
+/// membership is the canonical kill-target set, reaching descendants that
+/// escaped the job's process group (e.g. via `setsid`) the way a plain
+/// `kill(-pgid)` cannot. Returns the number of pids signaled; `Ok(0)` means
+/// the cgroup has no tracked pids (job already exited, or no cgroup at all).
+pub fn cgroup_signal(cgroup_path: &Path, sig: Signal) -> std::io::Result<usize> {
+    let pids = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
+    let mut signaled = 0;
+    for pid_str in pids.lines() {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            if signal::kill(Pid::from_raw(pid), sig).is_ok() {
+                signaled += 1;
+            }
+        }
+    }
+    Ok(signaled)
+}
+
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
 /// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
 pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
@@ -2401,6 +2420,32 @@ mod tests {
             first, second,
             "a redispatch must never share a cgroup with a not-yet-reaped prior attempt"
         );
+    }
+
+    #[test]
+    fn cgroup_signal_delivers_to_every_tracked_pid() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(cgroup.path().join("cgroup.procs"), child.id().to_string())
+            .expect("seed cgroup.procs");
+
+        let signaled =
+            cgroup_signal(cgroup.path(), Signal::SIGKILL).expect("signal every tracked pid");
+
+        assert_eq!(signaled, 1);
+        let status = child.wait().expect("wait for signaled child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn cgroup_signal_reports_the_read_failure_when_theres_no_cgroup() {
+        let missing = std::path::Path::new("/nonexistent/spur-cgroup-signal-test");
+        assert!(cgroup_signal(missing, Signal::SIGTERM).is_err());
     }
 
     #[tokio::test]

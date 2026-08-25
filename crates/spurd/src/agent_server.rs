@@ -67,6 +67,83 @@ fn resolve_stepd_executable() -> std::path::PathBuf {
     }
 }
 
+/// Detaches `spurstepd` via the same double-fork+setsid pattern Slurm's
+/// slurmd uses for slurmstepd: the immediate child forks again, `setsid()`s
+/// in the grandchild, then execs; the immediate child exits right away so
+/// the grandchild reparents to init and outlives spurd's own
+/// restarts/crashes. `Command::spawn`'s return value would only be the
+/// immediately-exiting intermediate child, so the grandchild reports its
+/// real pid back over a pipe before exec.
+fn spawn_stepd_process(
+    executable: &std::path::Path,
+    args: &[std::path::PathBuf],
+) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path =
+        std::ffi::CString::new(executable.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let mut c_args = vec![c_path.clone()];
+    for arg in args {
+        c_args.push(
+            std::ffi::CString::new(arg.as_os_str().as_bytes()).map_err(std::io::Error::other)?,
+        );
+    }
+    let c_arg_refs: Vec<&std::ffi::CStr> = c_args.iter().map(|s| s.as_c_str()).collect();
+
+    let (pipe_r, pipe_w) = nix::unistd::pipe()?;
+    let ready_r = pipe_r.as_raw_fd();
+    let ready_w = pipe_w.as_raw_fd();
+
+    match unsafe { nix::unistd::fork() }? {
+        // === intermediate child: synchronous code only, tokio runtime is
+        // broken here after fork. ===
+        nix::unistd::ForkResult::Child => {
+            unsafe { libc::close(ready_r) };
+            match unsafe { nix::unistd::fork() } {
+                Ok(nix::unistd::ForkResult::Child) => {
+                    // === grandchild: becomes spurstepd ===
+                    if nix::unistd::setsid().is_err() {
+                        unsafe { libc::_exit(1) };
+                    }
+                    let pid = std::process::id().to_ne_bytes();
+                    unsafe {
+                        libc::write(ready_w, pid.as_ptr().cast(), pid.len());
+                        libc::close(ready_w);
+                    }
+                    let _ = nix::unistd::execv(&c_path, &c_arg_refs);
+                    unsafe { libc::_exit(127) };
+                }
+                // Intermediate child: exit immediately so the grandchild is
+                // orphaned to init rather than waiting on this process.
+                _ => unsafe { libc::_exit(0) },
+            }
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            drop(pipe_w);
+            // Reap the near-instantly-exiting intermediate child so it
+            // doesn't accumulate as a zombie under spurd.
+            let _ = nix::sys::wait::waitpid(child, None);
+            let mut buf = [0u8; 4];
+            let mut read = 0;
+            while read < buf.len() {
+                match nix::unistd::read(&pipe_r, &mut buf[read..]) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
+            }
+            if read != buf.len() {
+                return Err(std::io::Error::other(
+                    "spurstepd exited before reporting its pid",
+                ));
+            }
+            Ok(u32::from_ne_bytes(buf))
+        }
+    }
+}
+
 async fn launch_stepd(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
@@ -123,35 +200,28 @@ async fn launch_stepd(
         )
     })?;
     let executable = resolve_stepd_executable();
-    let unit = stepd_unit(config.job_id, run_attempt);
-    info!(job_id = config.job_id, run_attempt, unit, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd unit");
-    let mut command = tokio::process::Command::new("systemd-run");
-    command
-        .arg("--unit")
-        .arg(unit)
-        .arg("--slice")
-        .arg("spur-runtime.slice")
-        .arg("--collect")
-        .arg("--no-block")
-        .arg("--service-type=exec")
-        .arg(executable)
-        .arg(state_dir)
-        .arg(config.job_id.to_string())
-        .arg(run_attempt.to_string())
-        .arg(launch_path);
-    let output = command
-        .output()
-        .await
-        .map_err(|error| executor::LaunchError::Other(error.into()))?;
-    if !output.status.success() {
-        cleanup_unstarted_stepd(&store, config.job_id, run_attempt, launch_spec.step_id);
-        return Err(executor::LaunchError::Other(anyhow::anyhow!(
-            "systemd-run failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
+    info!(job_id = config.job_id, run_attempt, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd process");
+    let spawn_args = vec![
+        state_dir.to_path_buf(),
+        std::path::PathBuf::from(config.job_id.to_string()),
+        std::path::PathBuf::from(run_attempt.to_string()),
+        launch_path,
+    ];
+    let spawn_executable = executable.clone();
+    let pid =
+        tokio::task::spawn_blocking(move || spawn_stepd_process(&spawn_executable, &spawn_args))
+            .await
+            .map_err(|error| executor::LaunchError::Other(error.into()))?
+            .map_err(|error| {
+                cleanup_unstarted_stepd(&store, config.job_id, run_attempt, launch_spec.step_id);
+                executor::LaunchError::Other(
+                    anyhow::Error::from(error).context("spawn stepd process"),
+                )
+            })?;
+    descriptor.pid = pid;
+    descriptor.process_start_ticks = crate::stepd::process_start_ticks(pid).unwrap_or(0);
     if let Err(error) = wait_for_stepd(&descriptor).await {
-        if let Err(stop_error) = stop_stepd_unit(config.job_id, run_attempt).await {
+        if let Err(stop_error) = stop_stepd_process(&descriptor).await {
             warn!(
                 job_id = config.job_id,
                 run_attempt,
@@ -184,36 +254,27 @@ async fn launch_stepd(
     ))
 }
 
-fn stepd_unit(job_id: u32, run_attempt: u32) -> String {
-    format!("spur-runtime-{job_id}.{run_attempt}")
-}
-
-async fn stop_stepd_unit(job_id: u32, run_attempt: u32) -> std::io::Result<()> {
-    let unit = stepd_unit(job_id, run_attempt);
-    let output = tokio::process::Command::new("systemctl")
-        .arg("stop")
-        .arg(&unit)
-        .output()
-        .await?;
-    if output.status.success() {
-        return Ok(());
+/// Signals a stepd process directly by pid — there's no systemd unit to stop
+/// it through. A stale pid (already exited, or reused by an unrelated
+/// process) is confirmed via `stepd_liveness` before signaling, same check
+/// the crash watchdog uses.
+async fn stop_stepd_process(descriptor: &crate::stepd::StepdDescriptor) -> std::io::Result<()> {
+    match crate::stepd::stepd_liveness(descriptor)? {
+        crate::stepd::StepdLiveness::Stale => Ok(()),
+        crate::stepd::StepdLiveness::Live => {
+            match nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(descriptor.pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            ) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Err(error) => Err(std::io::Error::from(error)),
+            }
+        }
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Units are started with `--collect`, so a process that already exited
-    // (the common case when stopping a session the controller has already
-    // fenced or marked stale) is no longer loaded by the time this runs.
-    // That is a successful "already gone" outcome, not a failed stop.
-    if stderr.contains("not loaded") {
-        return Ok(());
-    }
-    Err(std::io::Error::other(format!(
-        "systemctl stop {unit} failed: {}",
-        stderr.trim()
-    )))
 }
 
 /// Whether a torn-down stepd is confirmed dead. A cgroup path, if
-/// recorded, is authoritative — a successful unit stop only signals the
+/// recorded, is authoritative — a successful stop signal only reaches the
 /// supervisor, which by design ignores a raw SIGTERM for its job's cgroup.
 async fn runtime_teardown_confirmed(
     cgroup_path: &std::path::Path,
@@ -243,8 +304,8 @@ async fn fence_displaced_stepd(
     let Some(displaced) = displaced else {
         return Ok(());
     };
-    let displaced_attempt = displaced_runtime_attempt(&displaced, run_attempt)?;
-    let stop_result = stop_stepd_unit(displaced.job_id, displaced_attempt).await;
+    displaced_runtime_attempt(&displaced, run_attempt)?;
+    let stop_result = stop_stepd_process(&displaced).await;
     if !runtime_teardown_confirmed(&displaced.cgroup_path, &stop_result).await {
         return match stop_result {
             Err(error) => Err(error),
@@ -611,11 +672,8 @@ pub struct CompletionListenerContext {
 
 impl StepdRecoveryCleanup {
     pub async fn reject(&self, descriptor: &crate::stepd::StepdDescriptor) {
-        self.finish_rejection(
-            descriptor,
-            stop_stepd_unit(descriptor.job_id, descriptor.run_attempt).await,
-        )
-        .await;
+        self.finish_rejection(descriptor, stop_stepd_process(descriptor).await)
+            .await;
     }
 
     async fn finish_rejection(
@@ -3643,9 +3701,7 @@ impl SlurmAgent for AgentService {
                         if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                             warn!(job_id, error = %e, "PMIx stop failed after superseded stepd");
                         }
-                        if let Err(error) =
-                            stop_stepd_unit(descriptor.job_id, descriptor.run_attempt).await
-                        {
+                        if let Err(error) = stop_stepd_process(&descriptor).await {
                             warn!(job_id, run_attempt, %error, "failed to stop superseded stepd");
                         }
                         // This session never entered `stepds`, so the
@@ -4248,8 +4304,7 @@ impl SlurmAgent for AgentService {
                     run_attempt = req.run_attempt,
                     "stepd superseded by a newer attempt before it could be tracked; aborting"
                 );
-                if let Err(error) = stop_stepd_unit(descriptor.job_id, descriptor.run_attempt).await
-                {
+                if let Err(error) = stop_stepd_process(&descriptor).await {
                     warn!(job_id = req.job_id, %error, "failed to stop superseded stepd");
                 }
                 cleanup_stepd_files(&descriptor);
@@ -4267,9 +4322,11 @@ impl SlurmAgent for AgentService {
         if jobs.contains_key(&req.job_id) {
             drop(jobs);
             if runtime_descriptor {
-                self.stepds.lock().await.remove(&req.job_id);
-                if let Err(error) = stop_stepd_unit(req.job_id, req.run_attempt).await {
-                    warn!(job_id = req.job_id, %error, "failed to stop redundant stepd");
+                let removed = self.stepds.lock().await.remove(&req.job_id);
+                if let Some(descriptor) = removed {
+                    if let Err(error) = stop_stepd_process(&descriptor).await {
+                        warn!(job_id = req.job_id, %error, "failed to stop redundant stepd");
+                    }
                 }
             }
             return Err(Status::already_exists(format!(
@@ -6709,8 +6766,45 @@ mod tests {
     use tonic::Request;
 
     #[test]
-    fn stepd_unit_is_attempt_scoped() {
-        assert_eq!(stepd_unit(42, 7), "spur-runtime-42.7");
+    fn spawn_stepd_process_reports_a_live_setsid_grandchild() {
+        let marker = tempfile::NamedTempFile::new().expect("marker file");
+        let marker_path = marker.path().to_path_buf();
+        let executable = std::path::PathBuf::from("/bin/sh");
+        let args = vec![
+            std::path::PathBuf::from("-c"),
+            std::path::PathBuf::from(format!("echo ready > {}; sleep 5", marker_path.display())),
+        ];
+
+        let pid = spawn_stepd_process(&executable, &args).expect("spawn detached process");
+
+        for _ in 0..50 {
+            if std::fs::read_to_string(&marker_path).is_ok_and(|s| !s.is_empty()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+            Ok(()),
+            "reported pid must be a live process"
+        );
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("proc stat");
+        let (_, fields) = stat.rsplit_once(") ").expect("stat format");
+        let sid: i32 = fields
+            .split_ascii_whitespace()
+            .nth(3)
+            .expect("session id field")
+            .parse()
+            .expect("session id parses");
+        assert_eq!(
+            sid, pid as i32,
+            "the spawned process must be its own session leader"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
     }
 
     #[test]
@@ -6842,8 +6936,8 @@ mod tests {
         );
         sessions.lock().await.insert(42, displaced.clone());
 
-        // No real "spur-runtime-42.1" unit exists, so the stop attempt itself
-        // fails — cgroup confirmation alone must still be enough to proceed.
+        // pid 0 isn't a live process, so the stop signal is a trivial no-op —
+        // cgroup confirmation alone must still be enough to proceed.
         let result = fence_displaced_stepd(&sessions, 42, 2).await;
 
         assert!(
