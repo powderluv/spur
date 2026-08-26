@@ -101,6 +101,13 @@ The two daemons are configured with command-line flags. The most common are belo
    * - ``--listen <ADDR>``
      - ``[::]:6818``
      - Agent gRPC listen address.
+   * - ``--state-dir <PATH>``
+     - *(from config, then* ``/var/spool/spur`` *)*
+     - Directory for this agent's own persisted runtime state (job supervisor
+       sessions that survive an ``spurd`` restart). Also settable via
+       ``SPUR_STEPD_STATE_DIR``. Give each ``spurd`` its own path when
+       co-locating multiple agents on one host (e.g. dev/test setups) — it
+       must not collide with another agent's or the controller's directory.
    * - ``--log-level <LEVEL>``
      - ``info``
      - Log verbosity.

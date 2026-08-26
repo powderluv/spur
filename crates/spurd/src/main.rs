@@ -178,6 +178,11 @@ struct Args {
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Directory for this agent's own persisted runtime state (stepd sessions).
+    /// Defaults to the controller's configured state_dir, then /var/spool/spur.
+    #[arg(long, env = "SPUR_STEPD_STATE_DIR")]
+    state_dir: Option<String>,
 }
 
 /// Parses a stepd directory's `<job_id>.<run_attempt>.<step_id>` basename.
@@ -278,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
-    let stepd_state_dir = std::env::var("SPUR_STEPD_STATE_DIR").unwrap_or_else(|_| {
+    let stepd_state_dir = args.state_dir.clone().unwrap_or_else(|| {
         config
             .as_ref()
             .map(|c| c.controller.state_dir.clone())
