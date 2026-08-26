@@ -1957,6 +1957,30 @@ mod tests {
     }
 
     #[test]
+    fn create_private_dir_all_tolerates_a_shared_loosely_permissioned_parent() {
+        // spurd's stepd_state_dir defaults to spurctld's own state_dir when
+        // unset, so the parent is legitimately owned/created by a different
+        // component — only the leaf directory this call creates is spurd's
+        // exclusive turf and needs to be private.
+        use std::os::unix::fs::PermissionsExt;
+
+        let shared_parent = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(shared_parent.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("loosen shared parent permissions");
+        let exclusive_leaf = shared_parent.path().join("runtime");
+
+        create_private_dir_all(&exclusive_leaf).expect("create private leaf under shared parent");
+
+        assert!(exclusive_leaf.is_dir());
+        let leaf_mode = std::fs::metadata(&exclusive_leaf)
+            .expect("leaf metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(leaf_mode, 0o700);
+    }
+
+    #[test]
     fn create_private_dir_all_rejects_a_preexisting_dir_with_loose_permissions() {
         use std::os::unix::fs::PermissionsExt;
 

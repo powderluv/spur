@@ -539,7 +539,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
-    let agent_notify_socket_dir = std::path::Path::new(&stepd_state_dir);
+    // stepd_state_dir is shared with spurctld's own state_dir when the operator
+    // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
+    // exclusively spurd's — use the runtime/ subdir spurd already owns.
+    let agent_notify_socket_dir = stepds.root();
     stepd::create_private_dir_all(agent_notify_socket_dir)?;
     let agent_notify_socket = agent_notify_socket_dir.join(stepd::AGENT_NOTIFY_SOCKET_NAME);
     if agent_notify_socket.exists() {
