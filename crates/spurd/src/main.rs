@@ -180,13 +180,16 @@ struct Args {
     log_level: String,
 }
 
-/// Parses a stepd directory's `<job_id>.<run_attempt>` basename.
+/// Parses a stepd directory's `<job_id>.<run_attempt>.<step_id>` basename.
 /// Used to fence a session whose descriptor failed to parse — the job/attempt
 /// identity survives in the directory name even when its contents don't.
 fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32)> {
     let name = path.file_name()?.to_str()?;
-    let (job_id, run_attempt) = name.split_once('.')?;
-    Some((job_id.parse().ok()?, run_attempt.parse().ok()?))
+    let mut parts = name.splitn(3, '.');
+    let job_id = parts.next()?.parse().ok()?;
+    let run_attempt = parts.next()?.parse().ok()?;
+    parts.next()?;
+    Some((job_id, run_attempt))
 }
 
 /// True when retrying a runtime-recovery report can never help: the
@@ -537,17 +540,7 @@ async fn main() -> anyhow::Result<()> {
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
     let agent_notify_socket_dir = std::path::Path::new(&stepd_state_dir);
-    if !agent_notify_socket_dir.exists() {
-        std::fs::create_dir_all(agent_notify_socket_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                agent_notify_socket_dir,
-                std::fs::Permissions::from_mode(0o700),
-            )?;
-        }
-    }
+    stepd::create_private_dir_all(agent_notify_socket_dir)?;
     let agent_notify_socket = agent_notify_socket_dir.join(stepd::AGENT_NOTIFY_SOCKET_NAME);
     if agent_notify_socket.exists() {
         std::fs::remove_file(&agent_notify_socket)?;
@@ -819,6 +812,19 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    #[test]
+    fn parse_session_dir_name_reads_job_id_and_run_attempt() {
+        assert_eq!(
+            parse_session_dir_name(std::path::Path::new("42.1.4294967295")),
+            Some((42, 1))
+        );
+    }
+
+    #[test]
+    fn parse_session_dir_name_rejects_a_two_component_name() {
+        assert_eq!(parse_session_dir_name(std::path::Path::new("42.1")), None);
     }
 
     #[test]

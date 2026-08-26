@@ -1537,6 +1537,17 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Creates `path` (and any missing parents) as a private directory, or
+/// verifies an already-existing one meets that bar — never trusting a
+/// pre-existing directory's permissions blindly.
+#[cfg(unix)]
+pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    create_private_dir(path)
+}
+
 #[cfg(unix)]
 fn verify_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1929,6 +1940,35 @@ mod tests {
             .load_descriptor(&session_dir)
             .expect("load published descriptor");
         assert_eq!(loaded, descriptor);
+    }
+
+    #[test]
+    fn create_private_dir_all_creates_missing_parents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("a/b/c");
+
+        create_private_dir_all(&nested).expect("create nested private dir");
+
+        assert!(nested.is_dir());
+        assert!(
+            create_private_dir_all(&nested).is_ok(),
+            "must be idempotent"
+        );
+    }
+
+    #[test]
+    fn create_private_dir_all_rejects_a_preexisting_dir_with_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let loose = temp.path().join("loose");
+        std::fs::create_dir(&loose).expect("seed pre-existing dir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen permissions");
+
+        let error = create_private_dir_all(&loose)
+            .expect_err("a world-readable pre-existing directory must not be silently trusted");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
