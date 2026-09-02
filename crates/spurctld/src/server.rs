@@ -288,6 +288,7 @@ impl ControllerService {
         hostname: &str,
         job_id: u32,
         run_attempt: u32,
+        step_id: u32,
     ) -> Result<StepdRecoveryProbe, Status> {
         let Some(job) = self.cluster.get_job(job_id) else {
             return Ok(StepdRecoveryProbe::Stale);
@@ -325,6 +326,7 @@ impl ControllerService {
                         .probe_stepd(StepdProbeRequest {
                             job_id,
                             run_attempt,
+                            step_id,
                         })
                         .await
                         .map(|response| response.into_inner().active)
@@ -444,8 +446,8 @@ impl ControllerService {
                     node = %node,
                     "agent still holds an allocation the controller no longer believes belongs to it there — re-sending cancel to reclaim it"
                 );
-                // Signal 0 is a no-op on an unknown id, but SIGTERM/SIGKILLs a
-                // live process for the active-elsewhere case. Not epoch-gated.
+                // Signal 0 is a graceful cancel at the agent, not a probe, and
+                // attempt 0 hits whichever is tracked — see is_reclaimable above.
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
@@ -840,21 +842,21 @@ impl ControllerService {
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
-            return Ok(String::new());
+        if matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
+            if join_token.is_empty() {
+                return Err(Status::unauthenticated("admission token required"));
+            }
+
+            let (token_id, secret) = spur_core::admission::parse_token(join_token)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+            let token_store = self.cluster.get_tokens();
+            spur_core::admission::validate_token(token_id, secret, &token_store)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
         }
 
-        if join_token.is_empty() {
-            return Err(Status::unauthenticated("admission token required"));
-        }
-
-        let (token_id, secret) = spur_core::admission::parse_token(join_token)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
-
-        let token_store = self.cluster.get_tokens();
-        spur_core::admission::validate_token(token_id, secret, &token_store)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
-
+        // Minted independently of admission so stepd works under open admission;
+        // there the token attests the registered name, not an admitted one.
         if !self.node_identity_key_configured {
             return Ok(String::new());
         }
@@ -2168,7 +2170,12 @@ impl SlurmController for ControllerService {
         self.authorize_stepd_recovery_report(&request.hostname, &request.node_token)?;
 
         let probe = self
-            .probe_stepd_recovery(&request.hostname, request.job_id, request.run_attempt)
+            .probe_stepd_recovery(
+                &request.hostname,
+                request.job_id,
+                request.run_attempt,
+                request.step_id,
+            )
             .await?;
 
         if request.stale_descriptor {
@@ -6216,6 +6223,7 @@ mod tests {
             node_token: spur_core::admission::generate_node_token(hostname, svc.jwt_key.as_bytes())
                 .expect("node token"),
             stale_descriptor,
+            step_id: spur_core::step::STEP_BATCH,
         }
     }
 
@@ -6380,7 +6388,7 @@ mod tests {
     // hostname — otherwise anyone can claim to be any node and later use
     // the token to falsely report stepd recovery for that node's job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn validate_admission_mints_a_node_token_only_under_token_admission() {
+    async fn validate_admission_mints_a_node_token_under_open_admission() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_node_identity(&dir).await;
         assert_eq!(
@@ -6393,9 +6401,25 @@ mod tests {
             .validate_admission("", "n1")
             .expect("open admission registration is not an error");
         assert!(
-            token.is_empty(),
-            "open admission must not mint a node identity token"
+            !token.is_empty(),
+            "an identity key must mint a node token even under open admission, \
+             or stepd cannot run on a default cluster"
         );
+        let identity = spur_core::admission::verify_node_token(&token, svc.jwt_key.as_bytes())
+            .expect("minted token verifies");
+        assert_eq!(identity.hostname, "n1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_admission_mints_no_node_token_without_an_identity_key() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with(&dir, step_test_config()).await;
+        assert!(!svc.node_identity_key_configured);
+
+        let token = svc
+            .validate_admission("", "n1")
+            .expect("open admission registration is not an error");
+        assert!(token.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -10225,7 +10225,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job1 = run_job_on(&cm, "victim-1", "worker1");
-        cm.preempt_job(job1, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job1, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job1, JobState::Pending);
         assert_eq!(
@@ -10235,7 +10235,8 @@ mod tests {
         );
 
         let job2 = run_job_on(&cm, "victim-2", "worker1");
-        cm.preempt_job(job2, PreemptMode::Cancel, 99, None).unwrap();
+        cm.preempt_job_with_provenance(job2, PreemptMode::Cancel, Some(99), None)
+            .unwrap();
         settle(&cm, job2, JobState::Cancelled);
         assert_eq!(
             stats.snapshot().jobs_preempted,

@@ -264,6 +264,7 @@ pub struct StepdSnapshot {
 #[serde(tag = "obligation", rename_all = "snake_case")]
 pub enum StepdObligation {
     ExitObserved { exit_code: i32, signal: i32 },
+    EpilogCompleted { failed: bool },
     CompletionAcknowledged,
     ResourcesReleased,
 }
@@ -299,7 +300,10 @@ impl StepdObligationLog {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        contents
+        // A crash mid-append leaves a partial final line; complete entries are
+        // newline-terminated. Drop only that tail — other corruption must fail.
+        let complete = contents.rfind('\n').map_or("", |end| &contents[..=end]);
+        complete
             .lines()
             .enumerate()
             .map(|(line, entry)| {
@@ -590,7 +594,7 @@ fn finalized_obligations(obligations: &[StepdObligation]) -> bool {
                 completion_acknowledged = true;
             }
             StepdObligation::ResourcesReleased => resources_released = true,
-            StepdObligation::CompletionAcknowledged => {}
+            StepdObligation::CompletionAcknowledged | StepdObligation::EpilogCompleted { .. } => {}
         }
     }
 
@@ -983,12 +987,9 @@ pub async fn run_supervisor(
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
         tokio::select! {
-            _ = poll_interval.tick() => {
-                session.poll_completion().await?;
-                if !session.snapshot().await.active {
-                    return Ok(());
-                }
-            }
+            // A job can exit before the agent's first connect lands. Serve the
+            // accept queue first so the agent still completes its handoff.
+            biased;
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
@@ -999,6 +1000,12 @@ pub async fn run_supervisor(
                     Err(error) => {
                         tracing::warn!(%error, "stepd connection handshake failed");
                     }
+                }
+            }
+            _ = poll_interval.tick() => {
+                session.poll_completion().await?;
+                if !session.snapshot().await.active {
+                    return Ok(());
                 }
             }
         }
@@ -1047,8 +1054,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         anyhow::bail!("runtime launch spec job id does not match process arguments");
     }
     let step_id = launch_spec.step_id;
-    let agent_socket = state_dir.join(AGENT_NOTIFY_SOCKET_NAME);
     let store = StepdStore::new(state_dir);
+    let agent_socket = store.agent_socket();
     let session_dir = store.session_dir(job_id, run_attempt, step_id);
     let obligations = store.obligations(job_id, run_attempt, step_id);
     let socket_path = session_dir.join("runtime.sock");
@@ -1124,14 +1131,21 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let capability = descriptor.capability.clone();
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
-    if let Some(cgroup) = session.take_cgroup().await {
-        crate::executor::cleanup_cgroup(&cgroup);
-    }
-    if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
-        crate::container::cleanup_rootfs(&crate::container::job_rootfs_base(job_id), rootfs_mode);
-    }
-    crate::executor::cleanup_job_spool(job_id);
+    let cgroup = session.take_cgroup().await;
+    let teardown = |cgroup: Option<PathBuf>| async move {
+        if let Some(cgroup) = cgroup.as_ref() {
+            crate::executor::cleanup_cgroup(cgroup);
+        }
+        if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
+            crate::container::cleanup_rootfs(
+                &crate::container::job_rootfs_base(job_id),
+                rootfs_mode,
+            );
+        }
+        crate::executor::cleanup_job_spool(job_id);
+    };
     if let Err(error) = result {
+        teardown(cgroup).await;
         let failure_path = session_dir.join(FAILURE_FILE);
         if let Err(write_error) = std::fs::write(&failure_path, error.to_string()) {
             tracing::warn!(%write_error, path = %failure_path.display(), "failed to record stepd failure");
@@ -1142,6 +1156,19 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let exit_code = snapshot
         .exit_code
         .unwrap_or_else(|| 128 + snapshot.signal.unwrap_or(0));
+    let mut signal = snapshot.signal.unwrap_or(0);
+    // Read memory.events before teardown removes the cgroup, so an OOM kill is
+    // reported as one here too and not as a bare SIGKILL.
+    if let Some(cgroup) = cgroup.as_ref() {
+        if crate::agent_server::oom_killed_the_job(exit_code, signal, cgroup) {
+            tracing::warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
+            signal |= spur_core::job::OOM_SIGNAL_FLAG;
+        }
+    }
+    // Record the exit before teardown: cleanup, the epilog, and SPANK are
+    // unbounded operator code, and a crash in them must not read as "never ran".
+    obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
+    teardown(cgroup).await;
     let epilog_failed = if let Some(epilog) = hooks.epilog.as_deref() {
         if let Err(error) = spur_core::hooks::run_hook(epilog, &hook_context).await {
             tracing::error!(job_id, %error, "runtime epilog hook failed");
@@ -1169,8 +1196,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     }
-    let signal = snapshot.signal.unwrap_or(0);
-    obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
+    obligations.append(&StepdObligation::EpilogCompleted {
+        failed: epilog_failed,
+    })?;
     let notification = AgentNotification::StepdCompleted {
         job_id,
         run_attempt,
@@ -1189,6 +1217,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             step_id,
             exit_code,
             signal,
+            epilog_failed,
         })?;
     }
     Ok(exit_code)
@@ -1234,6 +1263,7 @@ pub struct PendingStepdCompletion {
     pub step_id: spur_core::step::StepId,
     pub exit_code: i32,
     pub signal: i32,
+    pub epilog_failed: bool,
 }
 
 #[derive(Clone)]
@@ -1250,6 +1280,12 @@ impl StepdStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Both the agent's bind and the supervisor's connect must derive the
+    /// notification socket here, or every push silently degrades to replay.
+    pub fn agent_socket(&self) -> PathBuf {
+        self.root.join(AGENT_NOTIFY_SOCKET_NAME)
     }
 
     pub fn session_dir(
@@ -1399,12 +1435,15 @@ impl StepdStore {
             );
             let mut observed_exit = None;
             let mut acknowledged = false;
+            let mut epilog_failed = false;
             for obligation in obligations.read()? {
                 match obligation {
                     StepdObligation::ExitObserved { exit_code, signal } => {
                         observed_exit = Some((exit_code, signal));
                         acknowledged = false;
+                        epilog_failed = false;
                     }
+                    StepdObligation::EpilogCompleted { failed } => epilog_failed = failed,
                     StepdObligation::CompletionAcknowledged if observed_exit.is_some() => {
                         acknowledged = true;
                     }
@@ -1419,6 +1458,7 @@ impl StepdStore {
                     step_id: descriptor.step_id,
                     exit_code,
                     signal,
+                    epilog_failed,
                 });
             }
         }
@@ -1490,6 +1530,26 @@ impl StepdStore {
                 StepdObligation::ExitObserved { exit_code, signal } => Some((*exit_code, *signal)),
                 _ => None,
             }))
+    }
+
+    /// Epilog result recorded after the last observed exit. A late-reported
+    /// completion must still drain the node when its epilog failed.
+    pub(crate) fn epilog_failed(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<bool> {
+        let obligations = self.obligations(job_id, run_attempt, step_id).read()?;
+        Ok(obligations
+            .iter()
+            .rev()
+            .find_map(|obligation| match obligation {
+                StepdObligation::EpilogCompleted { failed } => Some(*failed),
+                StepdObligation::ExitObserved { .. } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false))
     }
 
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
@@ -1627,6 +1687,7 @@ mod tests {
         StepdLaunchSpec {
             job_id: 42,
             step_id: spur_core::step::STEP_BATCH,
+            cgroup: Default::default(),
             script: "true".into(),
             work_dir: "/tmp".into(),
             name: "runtime-test".into(),
@@ -2101,6 +2162,7 @@ mod tests {
                 step_id: spur_core::step::STEP_BATCH,
                 exit_code: 7,
                 signal: 0,
+                epilog_failed: false,
             })
             .expect("acknowledge completion");
         assert_eq!(
@@ -2395,5 +2457,104 @@ mod tests {
             .await
             .expect("poll teardown completion");
         assert!(!session.snapshot().await.active);
+    }
+
+    #[test]
+    fn read_tolerates_a_torn_final_append_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("obligations.jsonl");
+        let log = StepdObligationLog::new(path.clone());
+        log.append(&StepdObligation::ExitObserved {
+            exit_code: 3,
+            signal: 0,
+        })
+        .expect("append exit");
+        // Power loss mid-append: a complete entry followed by an unterminated one.
+        let torn = format!(
+            "{}{{\"obligation\":\"epilog_comp",
+            fs::read_to_string(&path).expect("read log")
+        );
+        fs::write(&path, torn).expect("write torn log");
+        assert_eq!(
+            log.read().expect("torn tail is tolerated"),
+            vec![StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: 0
+            }]
+        );
+
+        // Corruption anywhere but the tail must still fail loudly.
+        fs::write(
+            &path,
+            "{\"obligation\":\"bogus\"}\n{\"obligation\":\"resources_released\"}\n",
+        )
+        .expect("write corrupt log");
+        assert!(log.read().is_err());
+    }
+
+    #[test]
+    fn epilog_failure_survives_for_a_late_reported_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        store
+            .prepare_session_dir(9, 2, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(9, 2, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("append exit");
+        assert!(!store
+            .epilog_failed(9, 2, spur_core::step::STEP_BATCH)
+            .expect("epilog state"));
+        obligations
+            .append(&StepdObligation::EpilogCompleted { failed: true })
+            .expect("append epilog result");
+        assert!(store
+            .epilog_failed(9, 2, spur_core::step::STEP_BATCH)
+            .expect("epilog state"));
+    }
+
+    #[tokio::test]
+    async fn completion_notice_reaches_the_socket_the_agent_binds() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        // Pinned literally, not via agent_socket(): the supervisor gets only the
+        // bare state dir, so its derivation must land on spurd's bind path.
+        let bound = state_dir.path().join("runtime").join("agent.sock");
+        fs::create_dir_all(bound.parent().expect("runtime dir")).expect("create runtime dir");
+        let listener = UnixListener::bind(&bound).expect("bind agent socket");
+        let agent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept notification");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read notice");
+            let payload =
+                serde_json::to_vec(&AgentNotificationResponse::Acknowledged).expect("encode");
+            writer.write_all(&payload).await.expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+            serde_json::from_str::<AgentNotification>(&line).expect("decode notice")
+        });
+
+        let store = StepdStore::new(state_dir.path());
+        let response = notify_agent_completion(
+            &store.agent_socket(),
+            &AgentNotification::StepdCompleted {
+                job_id: 7,
+                run_attempt: 1,
+                step_id: spur_core::step::default_step_id(),
+                exit_code: 0,
+                signal: 0,
+                epilog_failed: false,
+                capability: "cap".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(response, Some(AgentNotificationResponse::Acknowledged));
+        let AgentNotification::StepdCompleted { job_id, .. } = agent.await.expect("agent task");
+        assert_eq!(job_id, 7);
     }
 }

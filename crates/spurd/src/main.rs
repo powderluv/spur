@@ -186,15 +186,15 @@ struct Args {
 }
 
 /// Parses a stepd directory's `<job_id>.<run_attempt>.<step_id>` basename.
-/// Used to fence a session whose descriptor failed to parse — the job/attempt
+/// Used to fence a session whose descriptor failed to parse — the full
 /// identity survives in the directory name even when its contents don't.
-fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32)> {
+fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32, spur_core::step::StepId)> {
     let name = path.file_name()?.to_str()?;
     let mut parts = name.splitn(3, '.');
     let job_id = parts.next()?.parse().ok()?;
     let run_attempt = parts.next()?.parse().ok()?;
-    parts.next()?;
-    Some((job_id, run_attempt))
+    let step_id = parts.next()?.parse().ok()?;
+    Some((job_id, run_attempt, step_id))
 }
 
 /// True when retrying a runtime-recovery report can never help: the
@@ -298,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
     let mut corrupted_stepds = Vec::new();
     for (path, reason) in discovered_sessions.rejected {
         match parse_session_dir_name(&path) {
-            Some((job_id, run_attempt)) => corrupted_stepds.push((job_id, run_attempt)),
+            Some(identity) => corrupted_stepds.push(identity),
             None => unparseable_rejected.push((path, reason)),
         }
     }
@@ -318,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // A corrupted descriptor has no cgroup_path to read, but the path is
     // reconstructable from identity alone — reap it the same way.
-    for &(job_id, run_attempt) in &corrupted_stepds {
+    for &(job_id, run_attempt, _) in &corrupted_stepds {
         executor::cleanup_cgroup(&executor::expected_cgroup_path(job_id, run_attempt));
     }
     if !recovered_stepds.is_empty() {
@@ -547,9 +547,8 @@ async fn main() -> anyhow::Result<()> {
     // stepd_state_dir is shared with spurctld's own state_dir when the operator
     // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
     // exclusively spurd's — use the runtime/ subdir spurd already owns.
-    let agent_notify_socket_dir = stepds.root();
-    stepd::create_private_dir_all(agent_notify_socket_dir)?;
-    let agent_notify_socket = agent_notify_socket_dir.join(stepd::AGENT_NOTIFY_SOCKET_NAME);
+    stepd::create_private_dir_all(stepds.root())?;
+    let agent_notify_socket = stepds.agent_socket();
     if agent_notify_socket.exists() {
         std::fs::remove_file(&agent_notify_socket)?;
     }
@@ -626,7 +625,12 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 loop {
                     match recovery_reporter
-                        .report_stepd_recovery(descriptor.job_id, descriptor.run_attempt, false)
+                        .report_stepd_recovery(
+                            descriptor.job_id,
+                            descriptor.run_attempt,
+                            descriptor.step_id,
+                            false,
+                        )
                         .await
                     {
                         Ok(response) => {
@@ -686,18 +690,25 @@ async fn main() -> anyhow::Result<()> {
 
     let unreportable_sessions = stale_stepds
         .iter()
-        .map(|descriptor| (descriptor.job_id, descriptor.run_attempt))
+        .map(|descriptor| {
+            (
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+        })
         .chain(corrupted_stepds)
-        .filter(|id| {
-            !reconciled_stepd_completions.contains(id)
-                && !unacknowledged_stepd_completions.contains(id)
+        .filter(|(job_id, run_attempt, _)| {
+            let id = (*job_id, *run_attempt);
+            !reconciled_stepd_completions.contains(&id)
+                && !unacknowledged_stepd_completions.contains(&id)
         });
-    for (job_id, run_attempt) in unreportable_sessions {
+    for (job_id, run_attempt, step_id) in unreportable_sessions {
         let recovery_reporter = reporter.clone();
         tokio::spawn(async move {
             loop {
                 match recovery_reporter
-                    .report_stepd_recovery(job_id, run_attempt, true)
+                    .report_stepd_recovery(job_id, run_attempt, step_id, true)
                     .await
                 {
                     Ok(response) => {
@@ -823,10 +834,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_dir_name_reads_job_id_and_run_attempt() {
+    fn parse_session_dir_name_reads_the_full_identity() {
         assert_eq!(
             parse_session_dir_name(std::path::Path::new("42.1.4294967295")),
-            Some((42, 1))
+            Some((42, 1, 4294967295))
         );
     }
 

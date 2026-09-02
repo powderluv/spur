@@ -411,12 +411,48 @@ fn stepd_is_current(
     current == expected
 }
 
+/// A job that ran to success is not an OOM casualty even when something inside
+/// its cgroup was OOM-killed; only relabel one that actually failed.
+pub(crate) fn oom_killed_the_job(exit_code: i32, signal: i32, cgroup: &std::path::Path) -> bool {
+    (exit_code != 0 || signal != 0) && crate::executor::cgroup_oom_killed(cgroup)
+}
+
+fn unreported_durable_exit(
+    store: &crate::stepd::StepdStore,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> bool {
+    store
+        .discover_unacknowledged_completions()
+        .map(|pending| {
+            pending.iter().any(|completion| {
+                completion.job_id == job_id
+                    && completion.run_attempt == run_attempt
+                    && completion.step_id == step_id
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn cleanup_unstarted_stepd(
     store: &crate::stepd::StepdStore,
     job_id: u32,
     run_attempt: u32,
     step_id: spur_core::step::StepId,
 ) {
+    // A supervisor we never reached may still have run the job to completion.
+    // Deleting its recorded exit would turn that into a phantom launch failure.
+    if matches!(
+        store.observed_exit(job_id, run_attempt, step_id),
+        Ok(Some(_))
+    ) {
+        warn!(
+            job_id,
+            run_attempt, "keeping stepd state; it recorded an exit before readiness completed"
+        );
+        return;
+    }
     let session_dir = store.session_dir(job_id, run_attempt, step_id);
     if let Err(error) = std::fs::remove_dir_all(&session_dir) {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -691,6 +727,7 @@ pub struct CompletionListenerContext {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>>,
+    stepds_store: crate::stepd::StepdStore,
     controller_addr: String,
     hostname: String,
 }
@@ -929,6 +966,9 @@ pub(crate) fn monitor_recovered_stepds(
                     )
                     .await;
                 }
+                let epilog_failed = store
+                    .epilog_failed(job_id, run_attempt, step_id)
+                    .unwrap_or(false);
                 completed.insert(
                     job_id,
                     crate::stepd::PendingStepdCompletion {
@@ -937,6 +977,7 @@ pub(crate) fn monitor_recovered_stepds(
                         step_id,
                         exit_code,
                         signal,
+                        epilog_failed,
                     },
                 );
             }
@@ -1132,24 +1173,26 @@ async fn handle_completion_notification(
     })??;
     let notification: crate::stepd::AgentNotification =
         serde_json::from_str(&line).map_err(std::io::Error::other)?;
-    let (job_id, run_attempt, exit_code, signal, epilog_failed, capability) = match notification {
-        crate::stepd::AgentNotification::StepdCompleted {
-            job_id,
-            run_attempt,
-            step_id: _,
-            exit_code,
-            signal,
-            epilog_failed,
-            capability,
-        } => (
-            job_id,
-            run_attempt,
-            exit_code,
-            signal,
-            epilog_failed,
-            capability,
-        ),
-    };
+    let (job_id, run_attempt, step_id, exit_code, signal, epilog_failed, capability) =
+        match notification {
+            crate::stepd::AgentNotification::StepdCompleted {
+                job_id,
+                run_attempt,
+                step_id,
+                exit_code,
+                signal,
+                epilog_failed,
+                capability,
+            } => (
+                job_id,
+                run_attempt,
+                step_id,
+                exit_code,
+                signal,
+                epilog_failed,
+                capability,
+            ),
+        };
 
     let descriptor = context
         .stepds
@@ -1203,8 +1246,11 @@ async fn handle_completion_notification(
                 crate::stepd::AgentNotificationResponse::Deferred
             }
         }
-        // Nothing local to release (already handled, or a duplicate retry
-        // after a lost ack) — safe to let the caller prune.
+        // Usually a duplicate retry after a lost ack — but a session that
+        // finished pre-claim lands here too, so defer while its exit is unreported.
+        None if unreported_durable_exit(&context.stepds_store, job_id, run_attempt, step_id) => {
+            crate::stepd::AgentNotificationResponse::Deferred
+        }
         None => crate::stepd::AgentNotificationResponse::Acknowledged,
     };
 
@@ -1238,7 +1284,9 @@ pub async fn replay_unacknowledged_stepd_completions(
             completion.signal,
             completion.run_attempt,
             reporting_node,
-            None,
+            completion.epilog_failed.then_some(&DrainRequest {
+                reason: "epilog script failed".into(),
+            }),
         )
         .await
         {
@@ -2315,6 +2363,7 @@ impl AgentService {
             running: self.running.clone(),
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
+            stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
         }
@@ -2343,7 +2392,7 @@ impl AgentService {
                             // signal; read before cleanup_cgroup removes the dir.
                             let cgroup = tracked.take_cgroup();
                             if let Some(ref cg) = cgroup {
-                                if crate::executor::cgroup_oom_killed(cg) {
+                                if oom_killed_the_job(exit_code, signal, cg) {
                                     warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
                                     signal |= spur_core::job::OOM_SIGNAL_FLAG;
                                 }
@@ -4035,7 +4084,10 @@ impl SlurmAgent for AgentService {
             .lock()
             .await
             .get(&request.job_id)
-            .filter(|descriptor| descriptor.run_attempt == request.run_attempt)
+            .filter(|descriptor| {
+                descriptor.run_attempt == request.run_attempt
+                    && descriptor.step_id == request.step_id
+            })
             .cloned();
         let Some(descriptor) = descriptor else {
             return Ok(Response::new(StepdProbeResponse { active: false }));
@@ -7299,6 +7351,7 @@ mod tests {
                 step_id: spur_core::step::STEP_BATCH,
                 exit_code: 0,
                 signal: 0,
+                epilog_failed: false,
             })
             .expect("acknowledge completion");
 
@@ -7510,12 +7563,8 @@ mod tests {
 
         fence_dead_stepd(&running, &allocation, &sessions, &store, descriptor).await;
 
-        // A plain tempdir can't model real cgroupfs rmdir semantics (its
-        // pseudo-files don't count as directory entries there); check that
-        // cleanup actually reached the cgroup instead.
-        assert_eq!(
-            std::fs::read(cgroup.path().join("cgroup.kill")).expect("read cgroup.kill"),
-            b"1",
+        assert!(
+            !cgroup.path().exists(),
             "an orphaned cgroup left by a crashed session must be cleaned up"
         );
         // Cgroup reaping happens before tracking is released (not after), so
@@ -7530,6 +7579,7 @@ mod tests {
         CompletionListenerContext,
         RunningJobs,
         Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>>,
+        tempfile::TempDir,
     ) {
         let running = new_running_jobs();
         let allocation = Arc::new(Mutex::new(NodeAllocation::new(
@@ -7561,19 +7611,22 @@ mod tests {
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
         sessions.lock().await.insert(42, descriptor);
+        let state_dir = tempfile::tempdir().expect("state dir");
         let context = CompletionListenerContext {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            stepds_store: crate::stepd::StepdStore::new(state_dir.path()),
             controller_addr: controller_addr.into(),
             hostname: "test-node".into(),
         };
-        (context, running, sessions)
+        (context, running, sessions, state_dir)
     }
 
     #[tokio::test]
     async fn completion_notification_releases_local_tracking_even_when_controller_is_unreachable() {
-        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
             tokio::spawn(
@@ -7615,9 +7668,89 @@ mod tests {
         assert!(!sessions.lock().await.contains_key(&42));
     }
 
+    #[test]
+    fn a_successful_job_is_not_relabelled_out_of_memory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("memory.events"), "oom_kill 1\n").expect("write events");
+
+        assert!(
+            !oom_killed_the_job(0, 0, dir.path()),
+            "a job that exited 0 must not be reported OUT_OF_MEMORY"
+        );
+        assert!(oom_killed_the_job(0, 9, dir.path()));
+        assert!(oom_killed_the_job(137, 0, dir.path()));
+
+        std::fs::write(dir.path().join("memory.events"), "oom_kill 0\n").expect("write events");
+        assert!(!oom_killed_the_job(0, 9, dir.path()));
+    }
+
+    #[tokio::test]
+    async fn an_unclaimed_completion_is_deferred_rather_than_acknowledged_away() {
+        let (context, _running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
+        // Finished before the agent claimed its slot: nothing tracked locally,
+        // but the exit is durably recorded and unreported.
+        sessions.lock().await.remove(&42);
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        context
+            .stepds_store
+            .publish(&descriptor)
+            .expect("publish descriptor");
+        context
+            .stepds_store
+            .obligations(42, 7, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record exit");
+
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: spur_core::step::STEP_BATCH,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        handler.await.expect("handler task").expect("handle push");
+        assert_eq!(
+            serde_json::from_str::<crate::stepd::AgentNotificationResponse>(&line)
+                .expect("decode response"),
+            crate::stepd::AgentNotificationResponse::Deferred
+        );
+    }
+
     #[tokio::test]
     async fn a_completion_push_racing_the_liveness_watchdog_never_double_reports() {
-        let (context, _running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, _running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         let state = tempfile::tempdir().expect("runtime state directory");
         let store = crate::stepd::StepdStore::new(state.path());
         let mut descriptor = crate::stepd::StepdDescriptor::new(
@@ -7691,7 +7824,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_push_arriving_after_the_watchdog_already_fenced_it_just_acks() {
-        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         let descriptor = sessions
             .lock()
             .await
@@ -7757,7 +7891,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn completion_notification_acks_immediately_when_nothing_is_tracked() {
-        let (context, _running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, _running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         sessions.lock().await.remove(&42);
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
@@ -7800,7 +7935,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn completion_notification_rejects_a_capability_mismatch() {
-        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
             tokio::spawn(
@@ -7840,7 +7976,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn completion_notification_from_a_superseded_attempt_does_not_release_the_current_one() {
-        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, running, sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         // A redispatch bumped this job to run_attempt 8 after the fixture's
         // run_attempt-7 session was tracked; the old attempt's own (valid,
         // but now-stale) capability must not be able to touch the new one.
@@ -7921,7 +8058,8 @@ mod tests {
     async fn completion_notification_round_trips_over_a_real_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("agent.sock");
-        let (context, running, _sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (context, running, _sessions, _state_dir) =
+            completion_listener_fixture("http://127.0.0.1:1").await;
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
         tokio::spawn(serve_completion_notifications(listener, context));
         let notification = crate::stepd::AgentNotification::StepdCompleted {
@@ -9603,7 +9741,7 @@ mod tests {
         assert_eq!(cpus, 4, "budget must count both tasks");
 
         let (result, _) = svc
-            .allocate_local_resources(7, &spec, None, cpus, memory_mb)
+            .allocate_local_resources(7, 1, &spec, None, cpus, memory_mb)
             .await
             .expect("allocation succeeds");
         assert_eq!(result.cpu_ids, vec![0, 1, 2, 3]);
@@ -9632,7 +9770,7 @@ mod tests {
         assert_eq!((cpus, memory_mb), (3, 2048));
 
         let (result, _) = svc
-            .allocate_local_resources(7, &spec, Some(&allocated), cpus, memory_mb)
+            .allocate_local_resources(7, 1, &spec, Some(&allocated), cpus, memory_mb)
             .await
             .expect("allocation succeeds");
         assert_eq!(result.cpu_ids, vec![0, 1, 2]);

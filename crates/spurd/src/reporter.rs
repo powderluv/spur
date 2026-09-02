@@ -165,6 +165,7 @@ impl NodeReporter {
         &self,
         job_id: u32,
         run_attempt: u32,
+        step_id: spur_core::step::StepId,
         stale_descriptor: bool,
     ) -> anyhow::Result<StepdRecoveryResponse> {
         let channel = spur_client::connect_channel(&self.controller_addr)
@@ -183,6 +184,7 @@ impl NodeReporter {
                 run_attempt,
                 node_token,
                 stale_descriptor,
+                step_id,
             })
             .await
             .context("runtime recovery report failed")?;
@@ -262,7 +264,8 @@ fn should_reregister(status: &tonic::Status) -> bool {
 fn require_runtime_node_token(stepd: bool, node_token: &str) -> anyhow::Result<()> {
     if stepd && node_token.is_empty() {
         anyhow::bail!(
-            "Stepd requires [auth] jwt_key or jwt_key_file so this agent can prove its node identity"
+            "Stepd requires the controller to set [auth] jwt_key or jwt_key_file so this agent \
+             can prove its node identity, and this agent must be given the same key"
         );
     }
     Ok(())

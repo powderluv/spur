@@ -885,6 +885,8 @@ message StepdRecoveryRequest {
   uint32 run_attempt = 3;
   string node_token = 4;
   bool stale_descriptor = 5;
+  // Supervisors are per (job, attempt, step); 0 is the batch step.
+  uint32 step_id = 6;
 }
 
 message StepdRecoveryResponse {
@@ -1005,6 +1007,8 @@ message NodeResourcesResponse {
 message StepdProbeRequest {
   uint32 job_id = 1;
   uint32 run_attempt = 2;
+  // Supervisors are per (job, attempt, step); 0 is the batch step.
+  uint32 step_id = 3;
 }
 
 message StepdProbeResponse {

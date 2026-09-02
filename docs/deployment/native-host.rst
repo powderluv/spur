@@ -114,6 +114,17 @@ The two daemons are configured with command-line flags. The most common are belo
 
 .. note::
 
+   Restart survival (``SPUR_STEPD=1``) requires ``[auth] jwt_key`` (or
+   ``jwt_key_file``) set to the **same** value on the controller and on every
+   agent. The controller signs each node an identity token at registration, and
+   the agent presents it when reporting a supervisor it recovered after a
+   restart. Without the key ``spurd`` refuses to start rather than run with a
+   guarantee it cannot honour. The key is independent of ``[admission] mode`` —
+   restart survival works under open admission, though there the token attests
+   the name a node registered under rather than one an operator admitted.
+
+.. note::
+
    Node identity and networking (controller address, hostname, listen address) come
    from CLI flags. ``spurd`` also reads ``spur.conf`` for local agent settings —
    ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cgroup]``,
@@ -360,12 +371,23 @@ For production, run the agent as a systemd service:
    ExecStart=/usr/local/bin/spurd --controller http://10.44.0.1:6817 --hostname gpu-node-1 --address 10.44.0.2 --listen 0.0.0.0:6818 --log-level info
    Restart=on-failure
    RestartSec=3
+   KillMode=process
    User=root
    LimitMEMLOCK=infinity
    LimitNOFILE=65536
 
    [Install]
    WantedBy=multi-user.target
+
+.. important::
+
+   ``KillMode=process`` is required for jobs to survive an agent restart.
+   systemd's default, ``control-group``, signals every process in the unit's
+   cgroup on stop or restart. Job supervisors are deliberately detached from
+   the agent — their own session, reparented to init — so that
+   ``systemctl restart spurd`` leaves running work untouched. They nonetheless
+   remain in the unit's cgroup, so the default kill mode terminates them and
+   the next agent startup reclaims the now-orphaned job.
 
 Verify:
 
