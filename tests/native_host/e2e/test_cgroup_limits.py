@@ -88,9 +88,10 @@ def _run_probe(
     """Submit the probe pinned to node 0 and return its parsed cgroup values.
 
     With *expect_enforced* the job is required to have landed in its own
-    ``/spur/job_<id>`` cgroup. Checking that here turns "every control file
-    reads UNREADABLE" into one legible failure naming the cgroup it did land
-    in, which is otherwise an easy symptom to misread.
+    ``/spur/job_<id>_<attempt>`` cgroup (attempt is always 1 for a fresh,
+    non-requeued job). Checking that here turns "every control file reads
+    UNREADABLE" into one legible failure naming the cgroup it did land in,
+    which is otherwise an easy symptom to misread.
     """
     script = cluster.write_file(f"{name}.sh", _PROBE)
     out_path = f"{cluster.remote_dir}/{name}.out"
@@ -111,7 +112,7 @@ def _run_probe(
 
     probe = _Probe(_parse(content), job_id, content)
     if expect_enforced:
-        assert probe.values.get("CGROUP_PATH") == f"/spur/job_{job_id}", (
+        assert probe.values.get("CGROUP_PATH") == f"/spur/job_{job_id}_1", (
             f"job ran outside its own cgroup, so no limit was applied to it "
             f"(agent user: {cluster.spurd_agent_user(0)!r})\n{probe.context()}\n"
             f"spurd log:\n{cluster.spurd_log(0)[-2000:]}"
@@ -181,7 +182,7 @@ class TestCgroupDefaults:
             ["--cpus-per-task=1", "--mem=256", f"--container-image={image}"],
             "cg-container",
         )
-        assert probe.values["CGROUP_PATH"] == f"/spur/job_{probe.job_id}", (
+        assert probe.values["CGROUP_PATH"] == f"/spur/job_{probe.job_id}_1", (
             probe.context()
         )
 

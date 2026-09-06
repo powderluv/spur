@@ -449,9 +449,11 @@ CPU, Memory, and Device Limits (cgroups)
 ----------------------------------------
 
 ``spurd`` puts the processes it starts for a job into a cgroup-v2 group at
-``/sys/fs/cgroup/spur/job_<id>`` and enforces the **per-node budget the controller
-allocated** — the cores and memory the scheduler actually granted this node, not
-what the job asked for.
+``/sys/fs/cgroup/spur/job_<id>_<attempt>`` and enforces the **per-node budget the
+controller allocated** — the cores and memory the scheduler actually granted this
+node, not what the job asked for. The attempt suffix keys the cgroup by run
+attempt rather than job ID alone, so a redispatch never lands in a still-occupied
+cgroup left by a not-yet-reaped prior attempt.
 
 This covers every process the agent starts for a job: ``sbatch`` scripts,
 ``--pty`` jobs, containerized jobs (a container's process tree inherits the job
@@ -485,11 +487,11 @@ Inspect what a running job actually got:
 
 .. code-block:: bash
 
-   ls /sys/fs/cgroup/spur/                            # one dir per running job
-   cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus
-   cat /sys/fs/cgroup/spur/job_1234/memory.max
-   cat /sys/fs/cgroup/spur/job_1234/memory.swap.max
-   bpftool cgroup show /sys/fs/cgroup/spur/job_1234   # the device filter, if attached
+   ls /sys/fs/cgroup/spur/                            # one dir per running job attempt
+   cat /sys/fs/cgroup/spur/job_1234_1/cpuset.cpus
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.max
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.swap.max
+   bpftool cgroup show /sys/fs/cgroup/spur/job_1234_1 # the device filter, if attached
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -502,7 +504,7 @@ Slurm's ``cgroup.conf``.
 What is not contained yet
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Every process the agent starts for a job joins ``job_<id>`` — the batch payload,
+Every process the agent starts for a job joins ``job_<id>_<attempt>`` — the batch payload,
 ``srun`` steps, ``spur exec``, and interactive attach alike — so all of them are
 bounded by the job's limits and checked against its device filter. What remains
 is a granularity gap *inside* the job rather than a hole between jobs:
@@ -517,7 +519,7 @@ is a granularity gap *inside* the job rather than a hole between jobs:
      - Steps join the **job's** cgroup, not one of their own, so every step in a
        job draws on one shared budget and there is no per-step CPU or memory
        reading to attribute. Nested ``job_<id>/step_<n>`` cgroups are planned; a
-       BPF device filter attached at ``job_<id>`` is inherited by descendant
+       BPF device filter attached at ``job_<id>_<attempt>`` is inherited by descendant
        cgroups, so the filter will keep working unchanged when they arrive.
    * - Precise kill-by-step
      - Cancelling one step signals its process group rather than a cgroup of its
@@ -535,7 +537,7 @@ node-wide setup and teardown.
 .. note::
 
    **A step now counts against the job's budget.** An ``srun`` step used to run
-   outside ``job_<id>``, with no memory ceiling and no CPU pinning of its own; it
+   outside ``job_<id>_<attempt>``, with no memory ceiling and no CPU pinning of its own; it
    now shares the job's ``memory.max``, ``memory.high``, and ``cpuset.cpus``. A
    site whose steps routinely overrun what the job asked for will start seeing
    OOM kills where the same workload previously ran. Size ``--mem`` for the whole
