@@ -452,8 +452,9 @@ CPU, Memory, and Device Limits (cgroups)
 ``/sys/fs/cgroup/spur/job_<id>_<attempt>`` and enforces the **per-node budget the
 controller allocated** — the cores and memory the scheduler actually granted this
 node, not what the job asked for. The attempt suffix keys the cgroup by run
-attempt rather than job ID alone, so a redispatch never lands in a still-occupied
-cgroup left by a not-yet-reaped prior attempt.
+attempt rather than job ID alone, so a job launched again after a failure never
+lands in a still-occupied cgroup left by a prior attempt that has not been
+reaped yet.
 
 This covers every process the agent starts for a job: ``sbatch`` scripts,
 ``--pty`` jobs, containerized jobs (a container's process tree inherits the job
