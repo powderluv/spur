@@ -4347,7 +4347,7 @@ impl SlurmAgent for AgentService {
                         "failed to fence displaced stepd before allocation launch: {error}"
                     ))
                 })?;
-            let (_, descriptor) = launch_stepd(
+            let (_, mut descriptor) = launch_stepd(
                 &config,
                 req.run_attempt,
                 &self.reporter.controller_addr,
@@ -4364,6 +4364,16 @@ impl SlurmAgent for AgentService {
             .map_err(|error| {
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
+
+            // The allocation's cgroup is created here, not by the supervisor, so
+            // record it or a stale session leaves its steps unreaped.
+            if let Some(path) = cgroup_path.as_ref() {
+                descriptor.cgroup_path = path.clone();
+                let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+                if let Err(error) = store.publish(&descriptor) {
+                    warn!(job_id = req.job_id, %error, "failed to record allocation cgroup in the runtime descriptor");
+                }
+            }
 
             // Claim the slot before committing anything else, mirroring
             // LaunchJob: a concurrent registration for a strictly newer
