@@ -410,7 +410,7 @@ class TestCgroupDisabled:
 
 class TestCgroupLeftover:
     """A rootful job (or a crash) can leave a root-owned
-    ``/sys/fs/cgroup/spur/job_<id>`` that a non-root agent reusing that id cannot
+    ``/sys/fs/cgroup/spur/job_<id>_<attempt>`` that a non-root agent reusing that id cannot
     remove. The launch must degrade to no isolation and complete, not fail on
     every retry — the exact regression that once left jobs stuck PENDING.
     """
@@ -440,7 +440,7 @@ class TestCgroupLeftover:
         assert prime is not None
         planted = list(range(prime + 1, prime + 6))
         for jid in planted:
-            node.exec_allow_fail(f"sudo -n mkdir -p /sys/fs/cgroup/spur/job_{jid}")
+            node.exec_allow_fail(f"sudo -n mkdir -p /sys/fs/cgroup/spur/job_{jid}_1")
 
         try:
             script = cluster.write_file(
@@ -481,7 +481,7 @@ class TestCgroupLeftover:
             )
         finally:
             for jid in planted:
-                node.exec_allow_fail(f"sudo -n rmdir /sys/fs/cgroup/spur/job_{jid} 2>/dev/null")
+                node.exec_allow_fail(f"sudo -n rmdir /sys/fs/cgroup/spur/job_{jid}_1 2>/dev/null")
             node.exec_allow_fail("sudo -n rmdir /sys/fs/cgroup/spur 2>/dev/null")
 
 
@@ -572,8 +572,8 @@ class TestCgroupContainerStep:
             f"the step must run inside the container rootfs (exit {code})\noutput:\n{out}"
         )
         # The container's /proc still reports the host cgroup path (no cgroup-ns
-        # remap), so a joined step reads /spur/job_<id>; an uncontained one would
-        # read spurd's own cgroup instead.
+        # remap), so a joined step reads /spur/job_<id>_<attempt>; an uncontained
+        # one would read spurd's own cgroup instead.
         assert "0::/spur/job_" in out, (
             f"a container step must join the job cgroup (exit {code})\noutput:\n{out}"
         )
@@ -608,7 +608,7 @@ class TestCgroupEntryPathMembership:
             code, out = cluster.srun_in_allocation(job_id, ["cat", "/proc/self/cgroup"])
         finally:
             cluster.scancel(str(job_id))
-        assert f"0::/spur/job_{job_id}" in out, (
+        assert f"0::/spur/job_{job_id}_1" in out, (
             f"an srun step must join the job cgroup (exit {code})\noutput:\n{out}"
         )
 
@@ -621,7 +621,7 @@ class TestCgroupEntryPathMembership:
             )
         finally:
             cluster.scancel(str(job_id))
-        assert f"0::/spur/job_{job_id}" in out, (
+        assert f"0::/spur/job_{job_id}_1" in out, (
             f"spur exec must join the job cgroup\noutput:\n{out}"
         )
 
@@ -636,6 +636,6 @@ class TestCgroupEntryPathMembership:
             )
         finally:
             cluster.scancel(str(job_id))
-        assert f"0::/spur/job_{job_id}" in out, (
+        assert f"0::/spur/job_{job_id}_1" in out, (
             f"a --pty attach must join the job cgroup (exit {code})\noutput:\n{out}"
         )

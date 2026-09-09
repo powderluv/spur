@@ -221,7 +221,7 @@ def cgroup_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture for cgroup enforcement tests: a rootful, non-GPU cluster.
 
-    spurd must be root to create ``/sys/fs/cgroup/spur/job_<id>``; an
+    spurd must be root to create ``/sys/fs/cgroup/spur/job_<id>_<attempt>``; an
     unprivileged agent degrades to "no isolation" and every limit assertion
     would then pass vacuously, so the agent's user is checked up front.
     """

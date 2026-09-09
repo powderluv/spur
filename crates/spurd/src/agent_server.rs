@@ -411,12 +411,6 @@ fn stepd_is_current(
     current == expected
 }
 
-/// A job that ran to success is not an OOM casualty even when something inside
-/// its cgroup was OOM-killed; only relabel one that actually failed.
-pub(crate) fn oom_killed_the_job(exit_code: i32, signal: i32, cgroup: &std::path::Path) -> bool {
-    (exit_code != 0 || signal != 0) && crate::executor::cgroup_oom_killed(cgroup)
-}
-
 fn unreported_durable_exit(
     store: &crate::stepd::StepdStore,
     job_id: u32,
@@ -2392,7 +2386,7 @@ impl AgentService {
                             // signal; read before cleanup_cgroup removes the dir.
                             let cgroup = tracked.take_cgroup();
                             if let Some(ref cg) = cgroup {
-                                if oom_killed_the_job(exit_code, signal, cg) {
+                                if crate::executor::cgroup_oom_killed(cg) {
                                     warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
                                     signal |= spur_core::job::OOM_SIGNAL_FLAG;
                                 }
@@ -7673,22 +7667,6 @@ mod tests {
             "local tracking must be released regardless of controller reachability"
         );
         assert!(!sessions.lock().await.contains_key(&42));
-    }
-
-    #[test]
-    fn a_successful_job_is_not_relabelled_out_of_memory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("memory.events"), "oom_kill 1\n").expect("write events");
-
-        assert!(
-            !oom_killed_the_job(0, 0, dir.path()),
-            "a job that exited 0 must not be reported OUT_OF_MEMORY"
-        );
-        assert!(oom_killed_the_job(0, 9, dir.path()));
-        assert!(oom_killed_the_job(137, 0, dir.path()));
-
-        std::fs::write(dir.path().join("memory.events"), "oom_kill 0\n").expect("write events");
-        assert!(!oom_killed_the_job(0, 9, dir.path()));
     }
 
     #[tokio::test]

@@ -1160,7 +1160,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // Read memory.events before teardown removes the cgroup, so an OOM kill is
     // reported as one here too and not as a bare SIGKILL.
     if let Some(cgroup) = cgroup.as_ref() {
-        if crate::agent_server::oom_killed_the_job(exit_code, signal, cgroup) {
+        if crate::executor::cgroup_oom_killed(cgroup) {
             tracing::warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
             signal |= spur_core::job::OOM_SIGNAL_FLAG;
         }
