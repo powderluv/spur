@@ -1829,11 +1829,11 @@ mod tests {
         command.arg("-c").arg("trap '' TERM; while :; do :; done");
         command.process_group(0);
         let child = command.spawn().expect("spawn managed job");
-        let job = RunningJob::Managed {
-            child,
-            cgroup_path: Some(cgroup.path().to_path_buf()),
-        };
+        let job = RunningJob::managed(child);
         let session = Stepd::new(job, 83, 1, spur_core::step::STEP_BATCH);
+        session
+            .adopt_cgroup(Some(cgroup.path().to_path_buf()))
+            .await;
 
         session
             .signal(nix::sys::signal::Signal::SIGTERM as i32)
@@ -1874,11 +1874,11 @@ mod tests {
         command.arg("30");
         command.process_group(0);
         let child = command.spawn().expect("spawn managed job");
-        let job = RunningJob::Managed {
-            child,
-            cgroup_path: Some(cgroup.path().to_path_buf()),
-        };
+        let job = RunningJob::managed(child);
         let session = Stepd::new(job, 84, 1, spur_core::step::STEP_BATCH);
+        session
+            .adopt_cgroup(Some(cgroup.path().to_path_buf()))
+            .await;
 
         session
             .signal(nix::sys::signal::Signal::SIGTERM as i32)
@@ -1905,11 +1905,11 @@ mod tests {
         command.arg("30");
         command.process_group(0);
         let child = command.spawn().expect("spawn managed job");
-        let job = RunningJob::Managed {
-            child,
-            cgroup_path: Some(cgroup.path().to_path_buf()),
-        };
+        let job = RunningJob::managed(child);
         let session = Stepd::new(job, 85, 1, spur_core::step::STEP_BATCH);
+        session
+            .adopt_cgroup(Some(cgroup.path().to_path_buf()))
+            .await;
 
         session
             .signal(nix::sys::signal::Signal::SIGTERM as i32)

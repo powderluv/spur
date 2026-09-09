@@ -4268,7 +4268,6 @@ impl SlurmAgent for AgentService {
                         req.job_id
                     )),
                 })?;
-            let _ = alloc.commit_job(req.job_id, req.run_attempt);
             result
         };
         // Releases the allocation on any exit that does not record the job,
@@ -4302,6 +4301,7 @@ impl SlurmAgent for AgentService {
                 return Err(status);
             }
         };
+        drop(jobs);
 
         info!(
             job_id = req.job_id,
@@ -4432,12 +4432,19 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // srun allocation-only jobs use their own cancel lifecycle;
-                // epoch 0 leaves the stale-report guard disabled for them.
-                run_attempt: 0,
+                // Matches the epoch the allocation table was keyed with; 0 from an
+                // older controller keeps the previous stale-report-disabled behavior.
+                run_attempt: req.run_attempt,
                 cgroup_path,
             },
         );
+        // Commit under `running`, the order commit_job expects, so the job is
+        // never committed while absent from the map a reclaim reads.
+        let _ = self
+            .allocation
+            .lock()
+            .await
+            .commit_job(req.job_id, req.run_attempt);
         reservation_guard.disarm();
         drop(jobs);
 
@@ -7044,8 +7051,8 @@ mod tests {
         let blocker = cgroup.path().join("cgroup.kill");
         std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
         let blocker_removed = blocker.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
             std::fs::remove_dir(&blocker_removed).expect("clear blocker");
         });
         let displaced = crate::stepd::StepdDescriptor::new(
@@ -7288,8 +7295,8 @@ mod tests {
         let blocker = cgroup.path().join("cgroup.kill");
         std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
         let blocker_removed = blocker.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
             std::fs::remove_dir(&blocker_removed).expect("clear blocker");
         });
         let descriptor = crate::stepd::StepdDescriptor::new(
@@ -10262,10 +10269,7 @@ mod tests {
             .spawn()
             .expect("spawn short-lived job");
         let mut tracked = TrackedJob::dummy(0);
-        tracked.job = executor::RunningJob::Managed {
-            child,
-            cgroup_path: None,
-        };
+        tracked.job = executor::RunningJob::Managed { child };
         svc.insert_test_job(job_id, tracked).await;
 
         svc.start_monitor("http://127.0.0.1:1".into());
@@ -10589,10 +10593,10 @@ mod tests {
         // committed, guard armed, nothing recorded yet.
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(42, 1, 0, &[0]).unwrap();
-            alloc.commit_job(42);
+            alloc.allocate_for_job(42, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(42, 1);
         }
-        let reservation = LaunchReservationGuard::new(svc.allocation.clone(), 42);
+        let reservation = LaunchReservationGuard::new(svc.allocation.clone(), 42, 1);
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let status = {
@@ -11214,6 +11218,7 @@ mod tests {
         fn allocation_only_job(run_attempt: u32) -> TrackedJob {
             TrackedJob {
                 job: executor::RunningJob::AllocationOnly,
+                cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
@@ -11267,6 +11272,7 @@ mod tests {
             job_id,
             TrackedJob {
                 job: executor::RunningJob::AllocationOnly,
+                cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
@@ -11491,8 +11497,8 @@ mod tests {
             .await;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
-            alloc.commit_job(job_id);
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 1);
         }
 
         teardown_completed_job(
@@ -11534,8 +11540,8 @@ mod tests {
         let completed = completed_job(job_id, cgroup.clone());
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
-            alloc.commit_job(job_id);
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 1);
         }
 
         teardown_completed_job(

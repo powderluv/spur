@@ -2476,12 +2476,12 @@ mod tests {
         std::fs::create_dir(&blocker).expect("seed blocker directory");
 
         let blocker_removed = blocker.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
             std::fs::remove_dir(&blocker_removed).expect("clear blocker");
         });
 
-        cleanup_cgroup(cgroup.path()).await;
+        cleanup_cgroup(cgroup.path());
 
         assert!(
             !cgroup.path().exists(),
