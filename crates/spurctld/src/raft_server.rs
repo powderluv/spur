@@ -12,7 +12,9 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use spur_proto::raft_proto::raft_internal_server::{RaftInternal, RaftInternalServer};
-use spur_proto::raft_proto::{RaftRequest, RaftResponse};
+use spur_proto::raft_proto::{
+    ClusterProbeRequest, ClusterProbeResponse, RaftRequest, RaftResponse,
+};
 
 use crate::raft::{SpurRaft, SpurTypeConfig, RAFT_MAX_MESSAGE_SIZE};
 
@@ -63,6 +65,24 @@ impl RaftInternal for RaftInternalService {
             .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
 
         Ok(Response::new(RaftResponse { payload }))
+    }
+
+    async fn cluster_probe(
+        &self,
+        _request: Request<ClusterProbeRequest>,
+    ) -> Result<Response<ClusterProbeResponse>, Status> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let members: Vec<u64> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        Ok(Response::new(ClusterProbeResponse {
+            initialized: !members.is_empty(),
+            members,
+            last_log_index: metrics.last_log_index.unwrap_or(0),
+        }))
     }
 
     async fn install_snapshot(
@@ -137,6 +157,13 @@ mod tests {
             Ok(Response::new(RaftResponse {
                 payload: Vec::new(),
             }))
+        }
+
+        async fn cluster_probe(
+            &self,
+            _request: Request<ClusterProbeRequest>,
+        ) -> Result<Response<ClusterProbeResponse>, Status> {
+            Ok(Response::new(ClusterProbeResponse::default()))
         }
 
         async fn install_snapshot(

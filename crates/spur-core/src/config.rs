@@ -92,6 +92,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
+    /// Liveness and readiness HTTP (spurctld, default port 6823).
+    #[serde(default)]
+    pub probes: ProbesConfig,
+
     /// REST API (Slurm-compatible HTTP, default port 6820).
     #[serde(default)]
     pub rest_api: RestApiConfig,
@@ -218,6 +222,49 @@ impl MetricsConfig {
             MetricsBind::All => addr,
             MetricsBind::Loopback => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
         })
+    }
+}
+
+/// Liveness and readiness settings for spurctld.
+///
+/// Deliberately separate from [`MetricsConfig`]: metrics default to loopback and
+/// can be turned off, while an orchestrator must always be able to ask whether
+/// this controller still works. The two endpoints answer with a status code and
+/// one word, so they carry nothing worth hiding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbesConfig {
+    /// When false, spurctld does not start the probe HTTP server.
+    #[serde(default = "default_true_fn")]
+    pub enabled: bool,
+    /// Probe HTTP listen address. Bound as given.
+    #[serde(default = "default_probes_listen_addr")]
+    pub listen_addr: String,
+}
+
+fn default_probes_listen_addr() -> String {
+    "[::]:6823".into()
+}
+
+impl Default for ProbesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen_addr: default_probes_listen_addr(),
+        }
+    }
+}
+
+impl ProbesConfig {
+    /// Listen socket.
+    ///
+    /// Returns an error if `listen_addr` is not a valid `SocketAddr`.
+    pub fn effective_listen_addr(&self) -> Result<std::net::SocketAddr, ConfigError> {
+        self.listen_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "probes.listen_addr".into(),
+                value: e.to_string(),
+            })
     }
 }
 
@@ -2868,6 +2915,23 @@ grp_wall_window_days = {days}
             config.metrics.effective_listen_addr().unwrap(),
             "127.0.0.1:6822".parse().unwrap()
         );
+    }
+
+    /// Probes must not inherit the metrics bind policy. Metrics default to
+    /// loopback on purpose, and a probe that cannot reach the container makes
+    /// every replica permanently unready.
+    #[test]
+    fn probes_default_to_all_interfaces_whatever_metrics_does() {
+        let metrics = MetricsConfig::default();
+        assert_eq!(metrics.bind, MetricsBind::Loopback);
+
+        let probes = ProbesConfig::default();
+        assert!(probes.enabled);
+        let addr = probes
+            .effective_listen_addr()
+            .expect("default probe address parses");
+        assert!(!addr.ip().is_loopback());
+        assert_eq!(addr.port(), 6823);
     }
 
     #[test]

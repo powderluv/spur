@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use openraft::storage::{LogState, RaftLogReader, Snapshot, SnapshotMeta};
 use openraft::{
@@ -771,6 +772,27 @@ impl RaftHandle {
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
     }
+
+    /// Whether the RaftCore task is still running.
+    ///
+    /// openraft moves the metrics sender INTO RaftCore and keeps only the
+    /// receiver on the handle, so the channel closes exactly when that task
+    /// ends, whether it returned or panicked. A panicked core leaves this
+    /// process otherwise untouched: the gRPC listener is a different task and
+    /// keeps accepting connections, so without this check a controller that
+    /// cannot replicate anything still looks healthy.
+    pub fn is_core_running(&self) -> bool {
+        self.raft.metrics().has_changed().is_ok()
+    }
+
+    /// Resolves when the RaftCore task ends, and never before.
+    ///
+    /// `changed()` fails only when the sender is dropped, which happens when
+    /// RaftCore is gone.
+    pub async fn core_stopped(&self) {
+        let mut rx = self.raft.metrics();
+        while rx.changed().await.is_ok() {}
+    }
 }
 
 /// The system hostname as a UTF-8 string.
@@ -971,6 +993,77 @@ pub async fn start_raft(
     start_raft_with_recovery_mode(node_id, peers, state_dir, applier, true).await
 }
 
+/// What the peers say about an existing cluster, seen from a node whose own
+/// Raft store is empty.
+#[derive(Debug)]
+enum PeerVerdict {
+    /// No peer answered that it belongs to a cluster. This is a first start.
+    NoClusterFound,
+    /// A peer runs a cluster and this node is in its membership: catch up.
+    JoinExisting { peer: String, members: Vec<NodeId> },
+    /// A peer runs a cluster that does NOT list this node. Bootstrapping here
+    /// would make a second cluster.
+    NotAMember { peer: String, members: Vec<NodeId> },
+}
+
+/// Time given to each peer probe. Short: every peer is asked at once, and a
+/// peer that is still starting must not hold up a genuine first start.
+const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ask each peer except this node whether it already belongs to a cluster, and
+/// stop at the first one that answers yes.
+///
+/// A peer that refuses the connection is starting at the same time as this one,
+/// which is the ordinary first start. A peer that answers `UNIMPLEMENTED`
+/// predates this RPC; it is read as "no cluster", which keeps the behaviour a
+/// mixed-version cluster had before.
+async fn probe_peers(peer_map: &BTreeMap<NodeId, String>, node_id: NodeId) -> PeerVerdict {
+    for (_, addr) in peer_map.iter().filter(|(id, _)| **id != node_id) {
+        let Some((addr, members)) = probe_one_peer(addr.clone()).await else {
+            continue;
+        };
+        return if members.contains(&node_id) {
+            PeerVerdict::JoinExisting {
+                peer: addr,
+                members,
+            }
+        } else {
+            PeerVerdict::NotAMember {
+                peer: addr,
+                members,
+            }
+        };
+    }
+    PeerVerdict::NoClusterFound
+}
+
+/// Returns the peer address and its membership when the peer answers that it
+/// belongs to a cluster. `None` covers every failure, all of which mean "this
+/// peer tells us nothing".
+async fn probe_one_peer(addr: String) -> Option<(String, Vec<NodeId>)> {
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .ok()?
+        .connect_timeout(PEER_PROBE_TIMEOUT)
+        .timeout(PEER_PROBE_TIMEOUT);
+    let channel = tokio::time::timeout(PEER_PROBE_TIMEOUT, endpoint.connect())
+        .await
+        .ok()?
+        .ok()?;
+    let mut client = raft_client(channel);
+    let resp = tokio::time::timeout(
+        PEER_PROBE_TIMEOUT,
+        client.cluster_probe(spur_proto::raft_proto::ClusterProbeRequest {}),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .into_inner();
+    if !resp.initialized {
+        return None;
+    }
+    Some((addr, resp.members))
+}
+
 pub async fn start_raft_with_recovery_mode(
     node_id: NodeId,
     peers: &[String],
@@ -1011,12 +1104,39 @@ pub async fn start_raft_with_recovery_mode(
     if already_initialized {
         debug!("raft store has prior state; skipping redundant initialize()");
     } else {
-        let members: BTreeMap<NodeId, BasicNode> = peer_map
-            .iter()
-            .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
-            .collect();
-        if let Err(e) = raft.initialize(members).await {
-            debug!("raft initialize: {e} (already initialized)");
+        // An empty store alone does not mean the cluster is new. A replica added
+        // to a running cluster also starts empty, and if it bootstraps it forms a
+        // SECOND cluster that out-votes the one holding the data. Ask the peers
+        // first.
+        match probe_peers(&peer_map, node_id).await {
+            PeerVerdict::NoClusterFound => {
+                let members: BTreeMap<NodeId, BasicNode> = peer_map
+                    .iter()
+                    .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
+                    .collect();
+                if let Err(e) = raft.initialize(members).await {
+                    debug!("raft initialize: {e} (already initialized)");
+                }
+            }
+            PeerVerdict::JoinExisting { peer, members } => {
+                info!(
+                    node_id,
+                    %peer,
+                    ?members,
+                    "a peer already runs a cluster that lists this node; waiting for the leader \
+                     instead of bootstrapping"
+                );
+            }
+            PeerVerdict::NotAMember { peer, members } => {
+                anyhow::bail!(
+                    "refusing to start: this node has an empty Raft store, but peer {peer} \
+                     already runs a cluster whose members are {members:?} and node {node_id} is \
+                     not one of them. Bootstrapping here would make a SECOND cluster, panic the \
+                     replica that holds the data, and restart the job id counter. The replica \
+                     count of a running controller cannot be raised: deploy the intended count \
+                     from the start, or take the cluster down and build it again."
+                );
+            }
         }
     }
 
@@ -1046,7 +1166,7 @@ mod tests {
         }
     }
 
-    fn noop_applier() -> Arc<dyn StateMachineApply> {
+    pub(super) fn noop_applier() -> Arc<dyn StateMachineApply> {
         Arc::new(NoopApplier)
     }
 
@@ -1714,5 +1834,189 @@ mod tests {
             matches!(err, openraft::error::RPCError::Unreachable(_)),
             "expected Unreachable, got: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_guard_tests {
+    use super::tests::noop_applier;
+    use super::*;
+    use spur_proto::raft_proto::raft_internal_server::{RaftInternal, RaftInternalServer};
+    use spur_proto::raft_proto::{
+        ClusterProbeRequest, ClusterProbeResponse, RaftRequest, RaftResponse,
+    };
+    use std::net::SocketAddr;
+    use tonic::{Request, Response, Status};
+
+    /// A peer that answers ClusterProbe with a fixed membership. Only the probe
+    /// is exercised; the three Raft RPCs are never reached by these tests.
+    struct ProbePeer {
+        members: Vec<u64>,
+    }
+
+    #[tonic::async_trait]
+    impl RaftInternal for ProbePeer {
+        async fn append_entries(
+            &self,
+            _r: Request<RaftRequest>,
+        ) -> Result<Response<RaftResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+        async fn vote(&self, _r: Request<RaftRequest>) -> Result<Response<RaftResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+        async fn install_snapshot(
+            &self,
+            _r: Request<RaftRequest>,
+        ) -> Result<Response<RaftResponse>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+        async fn cluster_probe(
+            &self,
+            _r: Request<ClusterProbeRequest>,
+        ) -> Result<Response<ClusterProbeResponse>, Status> {
+            Ok(Response::new(ClusterProbeResponse {
+                initialized: !self.members.is_empty(),
+                members: self.members.clone(),
+                last_log_index: 53,
+            }))
+        }
+    }
+
+    async fn spawn_peer(members: Vec<u64>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(RaftInternalServer::new(ProbePeer { members }))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        addr
+    }
+
+    /// The 1-to-3 scale-up: an empty replica meets a peer whose cluster does not
+    /// list it. Bootstrapping there would make a second cluster, so startup must
+    /// fail instead.
+    #[tokio::test]
+    async fn empty_store_refuses_to_start_when_a_peer_runs_a_cluster_without_this_node() {
+        let peer = spawn_peer(vec![1]).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let peers = vec![
+            format!("{peer}"),
+            "127.0.0.1:1".into(), // node 2, this node: never probed
+            "127.0.0.1:2".into(),
+        ];
+
+        let result = start_raft(2, &peers, dir.path(), noop_applier()).await;
+        let msg = match result {
+            Ok(_) => panic!("must refuse to bootstrap a second cluster"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("refusing to start"), "{msg}");
+        assert!(msg.contains("SECOND cluster"), "{msg}");
+    }
+
+    /// A replica that IS in the peer's membership is a legitimate member that has
+    /// simply lost its volume. It must start and catch up, not fail.
+    #[tokio::test]
+    async fn empty_store_starts_when_the_peer_cluster_already_lists_this_node() {
+        let peer = spawn_peer(vec![1, 2, 3]).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let peers = vec![
+            format!("{peer}"),
+            "127.0.0.1:1".into(),
+            "127.0.0.1:2".into(),
+        ];
+
+        start_raft(2, &peers, dir.path(), noop_applier())
+            .await
+            .expect("a member that lost its volume must be allowed to catch up");
+    }
+
+    /// A peer that answers "no cluster" leaves the ordinary first start alone.
+    #[tokio::test]
+    async fn empty_store_bootstraps_when_no_peer_reports_a_cluster() {
+        let peer = spawn_peer(vec![]).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let peers = vec![
+            format!("{peer}"),
+            "127.0.0.1:1".into(),
+            "127.0.0.1:2".into(),
+        ];
+
+        let handle = start_raft(2, &peers, dir.path(), noop_applier())
+            .await
+            .expect("a first start must bootstrap");
+        assert_eq!(handle.node_id, 2);
+    }
+
+    /// The probe answers with the whole membership. A learner is a member that
+    /// only misses the vote, so it must be in the answer; otherwise a learner
+    /// that lost its volume would be read as a stranger and refused.
+    #[tokio::test]
+    async fn cluster_probe_reports_learners_as_members() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = start_raft(1, &["127.0.0.1:1".into()], dir.path(), noop_applier())
+            .await
+            .unwrap();
+        node.raft
+            .wait(Some(Duration::from_secs(10)))
+            .state(openraft::ServerState::Leader, "node 1 leads")
+            .await
+            .unwrap();
+        node.raft
+            .add_learner(2, BasicNode::new("127.0.0.1:2".to_string()), false)
+            .await
+            .unwrap();
+
+        let service = crate::raft_server::RaftInternalService::new(node.raft.clone());
+        let resp = service
+            .cluster_probe(Request::new(ClusterProbeRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.initialized);
+        assert_eq!(resp.members, vec![1, 2]);
+    }
+
+    /// An empty replica that the cluster lists as a learner only is a member
+    /// that lost its volume. It must start and catch up, not refuse.
+    #[tokio::test]
+    async fn empty_store_starts_when_the_peer_cluster_lists_this_node_as_a_learner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener.local_addr().unwrap();
+        let dir1 = tempfile::TempDir::new().unwrap();
+        let node1 = start_raft(1, &[addr1.to_string()], dir1.path(), noop_applier())
+            .await
+            .unwrap();
+        node1
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .state(openraft::ServerState::Leader, "node 1 leads")
+            .await
+            .unwrap();
+        node1
+            .raft
+            .add_learner(2, BasicNode::new("127.0.0.1:2".to_string()), false)
+            .await
+            .unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let raft1 = node1.raft.clone();
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(RaftInternalServer::new(
+                    crate::raft_server::RaftInternalService::new(raft1),
+                ))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let peers = vec![addr1.to_string(), "127.0.0.1:2".into()];
+        start_raft(2, &peers, dir2.path(), noop_applier())
+            .await
+            .expect("a learner that lost its volume must be allowed to catch up");
     }
 }

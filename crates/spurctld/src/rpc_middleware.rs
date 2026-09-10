@@ -200,6 +200,7 @@ mod tests {
                 isolation: Default::default(),
                 licenses: HashMap::new(),
                 update: Default::default(),
+                probes: Default::default(),
                 metrics: Default::default(),
                 rest_api: Default::default(),
                 hooks: Default::default(),
