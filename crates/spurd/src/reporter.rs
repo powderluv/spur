@@ -256,13 +256,13 @@ fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
 }
 
-/// Jobs are supervised either way; without a signing key the controller cannot
-/// verify a recovery report, so a recovered supervisor is kept unverified.
+/// Jobs are supervised either way; without a signing key the controller takes a
+/// recovery report on trust rather than dropping a live supervisor.
 fn warn_without_node_identity(node_token: &str) {
     if node_token.is_empty() {
         warn!(
-            "controller issued no node identity ([auth] jwt_key unset): recovered supervisors \
-             cannot be verified after a restart and are kept without controller confirmation"
+            "no node identity issued ([auth] jwt_key unset): recovery reports are accepted \
+             unverified; set jwt_key to have this node prove its identity"
         );
     }
 }

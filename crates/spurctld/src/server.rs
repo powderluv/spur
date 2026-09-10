@@ -400,10 +400,15 @@ impl ControllerService {
         hostname: &str,
         node_token: &str,
     ) -> Result<(), Status> {
+        // Without a signing key there is nothing to verify the node against, so
+        // the report is taken on trust rather than dropping a live supervisor.
         if !self.node_identity_key_configured {
-            return Err(Status::failed_precondition(
-                "stepd recovery requires [auth] jwt_key or jwt_key_file",
-            ));
+            warn!(
+                hostname,
+                "accepting unverified stepd recovery ([auth] jwt_key unset); \
+                 set jwt_key to have the node prove its identity"
+            );
+            return Ok(());
         }
         if hostname.is_empty() {
             return Err(Status::invalid_argument("hostname required"));
@@ -6449,6 +6454,17 @@ mod tests {
                 .hostname,
             "n1"
         );
+    }
+
+    // Dropping the report would abandon a supervisor that is still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authorize_stepd_recovery_report_is_taken_on_trust_without_a_signing_key() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with(&dir, step_test_config()).await;
+        assert!(!svc.node_identity_key_configured);
+
+        svc.authorize_stepd_recovery_report("n1", "")
+            .expect("recovery is accepted unverified when no key is configured");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
