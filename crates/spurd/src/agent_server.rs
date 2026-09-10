@@ -266,11 +266,14 @@ async fn launch_stepd(
     // report the one the supervisor created rather than leaving them outside it.
     let cgroup_path =
         Some(descriptor.cgroup_path.clone()).filter(|path| !path.as_os_str().is_empty());
+    // scontrol reports these back, so resolve the patterns the same way the
+    // unsupervised launch does rather than echoing the raw request.
+    let work_dir = descriptor.work_dir.clone();
     Ok((
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
-            stdout_path: config.stdout_path.clone(),
-            stderr_path: config.stderr_path.clone(),
+            stdout_path: executor::resolve_output_path(config, &work_dir, &config.stdout_path),
+            stderr_path: executor::resolve_output_path(config, &work_dir, &config.stderr_path),
             pty_master: None,
             cgroup_path,
         },
@@ -2427,6 +2430,15 @@ impl AgentService {
     /// this process exiting.
     pub fn stepds_handle(&self) -> Arc<Mutex<StepdMap>> {
         self.stepds.clone()
+    }
+
+    /// The job's own process as reported by its supervisor. Taken before any
+    /// `running` lock so the stepds -> running order is preserved.
+    async fn supervised_job_pid(&self, job_id: u32) -> Option<i32> {
+        stepds_for_job(&*self.stepds.lock().await, job_id)
+            .into_iter()
+            .map(|descriptor| descriptor.job_pid)
+            .find(|pid| *pid != 0)
     }
 
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
@@ -4602,6 +4614,7 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
+        let supervised_pid = self.supervised_job_pid(job_id).await;
         let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -4618,10 +4631,8 @@ impl SlurmAgent for AgentService {
             // belong to the process at the root of the job's cgroup.
             let pid = match tracked.job.pid() {
                 Some(pid) => pid as i32,
-                None => tracked
-                    .cgroup_path
-                    .as_deref()
-                    .and_then(cgroup_root_pid)
+                None => supervised_pid
+                    .or_else(|| tracked.cgroup_path.as_deref().and_then(cgroup_root_pid))
                     .unwrap_or(0),
             };
             let entry = crate::job_entry::JobEntry {
@@ -6015,16 +6026,36 @@ impl AgentService {
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
     async fn suspend_signal(&self, job_id: u32, resume: bool) {
-        let jobs = self.running.lock().await;
-        let Some(tracked) = jobs.get(&job_id) else {
-            return;
-        };
         let sig = if resume {
             nix::sys::signal::Signal::SIGCONT
         } else {
             nix::sys::signal::Signal::SIGSTOP
         };
         info!(job_id, resume, "sending suspend/resume signal to job");
+
+        // A supervised job's processes belong to its supervisor, so freeze the
+        // whole tree through it rather than the agent's own (absent) handle.
+        let runtimes = stepds_for_job(&*self.stepds.lock().await, job_id);
+        if owns_job_processes(&runtimes) {
+            for descriptor in runtimes {
+                if let Err(error) = crate::stepd::signal_allocation(
+                    &descriptor,
+                    uuid::Uuid::new_v4().to_string(),
+                    sig as i32,
+                )
+                .await
+                {
+                    warn!(job_id, step_id = descriptor.step_id, %error,
+                        "runtime suspend/resume request failed");
+                }
+            }
+            return;
+        }
+
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id) else {
+            return;
+        };
         let _ = tracked.job.kill_signal(sig);
     }
 
@@ -6251,6 +6282,7 @@ impl AgentService {
     /// node has confirmed LaunchJob (confirm_dispatch_on_nodes) — so no retry
     /// on a miss. Restart mid-job (empty `running`) is the one uncovered case.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
+        let supervised_pid = self.supervised_job_pid(job_id).await;
         let jobs = self.running.lock().await;
         let tracked = jobs
             .get(&job_id)
@@ -6260,10 +6292,8 @@ impl AgentService {
         // belong to the process at the root of the job's cgroup.
         let pid = match tracked.job.pid() {
             Some(pid) => pid as i32,
-            None => tracked
-                .cgroup_path
-                .as_deref()
-                .and_then(cgroup_root_pid)
+            None => supervised_pid
+                .or_else(|| tracked.cgroup_path.as_deref().and_then(cgroup_root_pid))
                 .unwrap_or(0),
         };
 

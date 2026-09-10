@@ -30,8 +30,11 @@ class TestStepdRestartSurvival:
             "echo SURVIVED\n",
             all_nodes=True,
         )
+        node = cluster.node_names[0]
         job_id = parse_job_id(
-            cluster.sbatch(["-J", "stepd-survive", "-N", "1", "-o", out_path, script])
+            cluster.sbatch(
+                ["-J", "stepd-survive", "-w", node, "-o", out_path, script]
+            )
         )
         assert job_id is not None
         wait_job_state(cluster, job_id, "R")
@@ -54,7 +57,9 @@ class TestStepdRestartSurvival:
     def test_a_completed_jobs_session_is_pruned(self, cluster):
         before = set(_sessions(cluster))
         job_id = parse_job_id(
-            cluster.sbatch(["-J", "stepd-prune", "-N", "1", "--wrap", "true"])
+            cluster.sbatch(
+                ["-J", "stepd-prune", "-w", cluster.node_names[0], "--wrap", "true"]
+            )
         )
         assert job_id is not None
         assert wait_job(cluster, job_id, timeout=120) == "CD"
@@ -73,7 +78,9 @@ class TestStepdRestartSurvival:
             "#!/bin/bash\nfor i in $(seq 1 120); do sleep 2; done\n",
             all_nodes=True,
         )
-        job_id = parse_job_id(cluster.sbatch(["-J", "stepd-cancel", "-N", "1", script]))
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "stepd-cancel", "-w", cluster.node_names[0], script])
+        )
         assert job_id is not None
         wait_job_state(cluster, job_id, "R")
         assert _supervisors(cluster) > baseline

@@ -1866,7 +1866,7 @@ pub fn cleanup_job_spool(job_id: JobId) {
 /// Resolve output path patterns (%j → job_id, etc.)
 /// Resolve a pattern against the *effective* work_dir (may be the `/tmp`
 /// fallback) via the shared resolver, so agent and controller paths match.
-fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern: &str) -> String {
+pub(crate) fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern: &str) -> String {
     spur_core::job::resolve_output_pattern(
         pattern,
         &spur_core::job::OutputPathContext {

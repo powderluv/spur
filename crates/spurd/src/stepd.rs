@@ -533,6 +533,10 @@ pub struct StepdDescriptor {
     pub gid: u32,
     #[serde(default)]
     pub work_dir: String,
+    /// The job's own process, which owns its namespaces. The supervisor's own
+    /// pid is `pid`; this is what exec and attach must enter.
+    #[serde(default)]
+    pub job_pid: i32,
 }
 
 impl StepdDescriptor {
@@ -560,6 +564,7 @@ impl StepdDescriptor {
             uid: 0,
             gid: 0,
             work_dir: String::new(),
+            job_pid: 0,
         }
     }
 }
@@ -1137,10 +1142,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     };
+    descriptor.job_pid = job.pid().unwrap_or(0) as i32;
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
+    }
+    if launched_cgroup.is_some() || descriptor.job_pid != 0 {
         if let Err(error) = store.publish(&descriptor) {
-            tracing::warn!(job_id, %error, "failed to republish runtime descriptor with cgroup path");
+            tracing::warn!(job_id, %error, "failed to republish runtime descriptor");
         }
     }
     let session = Arc::new(Stepd::with_environment(
