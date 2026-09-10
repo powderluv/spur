@@ -114,14 +114,16 @@ The two daemons are configured with command-line flags. The most common are belo
 
 .. note::
 
-   Restart survival (``SPUR_STEPD=1``) requires ``[auth] jwt_key`` (or
-   ``jwt_key_file``) set to the **same** value on the controller and on every
-   agent. The controller signs each node an identity token at registration, and
-   the agent presents it when reporting a supervisor it recovered after a
-   restart. Without the key ``spurd`` refuses to start rather than run with a
-   guarantee it cannot honour. The key is independent of ``[admission] mode`` —
-   restart survival works under open admission, though there the token attests
-   the name a node registered under rather than one an operator admitted.
+   Every job runs under a per-job supervisor, so batch, container and
+   allocation jobs keep running across an ``spurd`` restart or upgrade. Direct
+   ``--mpi=pmix`` batch jobs (no inner ``srun``) are the one exception: they
+   still launch unsupervised and do **not** survive a restart.
+
+   Setting ``[auth] jwt_key`` (or ``jwt_key_file``) to the same value on the
+   controller and every agent lets the controller verify a supervisor an agent
+   recovered after a restart, and fence one belonging to a superseded run.
+   Without it the agent still supervises and still re-adopts, but the recovery
+   report cannot be verified and the supervisor is kept unconfirmed.
 
 .. note::
 

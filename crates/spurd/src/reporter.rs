@@ -104,13 +104,8 @@ impl NodeReporter {
             .context("failed to connect to spurctld for registration")?;
         let mut client = spur_proto::controller_client(channel);
 
-        let stepd = std::env::var("SPUR_STEPD")
-            .ok()
-            .is_some_and(|value| value == "1");
         let mut labels = self.labels.clone();
-        if stepd {
-            labels.insert("spur.stepd".into(), "1".into());
-        }
+        labels.insert("spur.stepd".into(), "1".into());
 
         let resp = client
             .register_agent(RegisterAgentRequest {
@@ -128,7 +123,7 @@ impl NodeReporter {
 
         let inner = resp.into_inner();
         if inner.accepted {
-            require_runtime_node_token(stepd, &inner.node_token)?;
+            warn_without_node_identity(&inner.node_token);
             if !inner.node_token.is_empty() {
                 *self.node_token.write().unwrap() = inner.node_token;
             }
@@ -261,14 +256,15 @@ fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
 }
 
-fn require_runtime_node_token(stepd: bool, node_token: &str) -> anyhow::Result<()> {
-    if stepd && node_token.is_empty() {
-        anyhow::bail!(
-            "Stepd requires the controller to set [auth] jwt_key or jwt_key_file so this agent \
-             can prove its node identity, and this agent must be given the same key"
+/// Jobs are supervised either way; without a signing key the controller cannot
+/// verify a recovery report, so a recovered supervisor is kept unverified.
+fn warn_without_node_identity(node_token: &str) {
+    if node_token.is_empty() {
+        warn!(
+            "controller issued no node identity ([auth] jwt_key unset): recovered supervisors \
+             cannot be verified after a restart and are kept without controller confirmation"
         );
     }
-    Ok(())
 }
 
 /// Discover local node resources from sysfs / /proc + device registry.
@@ -647,10 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn stepd_registration_requires_a_node_credential() {
-        assert!(require_runtime_node_token(false, "").is_ok());
-        assert!(require_runtime_node_token(true, "node-credential").is_ok());
-        assert!(require_runtime_node_token(true, "").is_err());
+    fn a_missing_node_credential_warns_but_does_not_block_registration() {
+        // Supervision no longer depends on the credential; only the
+        // controller-verified recovery handshake does.
+        warn_without_node_identity("");
+        warn_without_node_identity("node-credential");
     }
 
     #[test]

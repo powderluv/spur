@@ -2163,6 +2163,10 @@ pub struct AgentService {
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<HashMap<u32, crate::stepd::StepdDescriptor>>>,
     stepd_state_dir: std::path::PathBuf,
+    /// Unit tests exercise launch mechanics without a built `spurstepd`, so they
+    /// keep the legacy path. Production always supervises.
+    #[cfg(test)]
+    force_legacy_launch: bool,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
@@ -2199,6 +2203,11 @@ impl AgentService {
         // Deterministic regardless of whether the test runner is root: a root runner would
         // otherwise make every launch test (which uses the default uid 0) hit the refusal.
         .with_root_override(false)
+        // Every job is supervised now, so a test that launches needs a writable
+        // runtime root; the production default is not writable unprivileged.
+        .with_runtime_state_dir(
+            std::env::temp_dir().join(format!("spur-test-runtime-{}", uuid::Uuid::new_v4())),
+        )
     }
 
     /// Construct with the `[cluster]` config so this node's K0sAgent honors the operator's k0s
@@ -2281,6 +2290,8 @@ impl AgentService {
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            force_legacy_launch: true,
             stepd_state_dir: std::env::var("SPUR_STEPD_STATE_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
@@ -3255,14 +3266,19 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // Direct-launch PMIx-in-Stepd lands in a follow-up PR — fall
-        // back to the legacy (non-runtime) launch path for that case only.
+        // Every job is supervised except direct-launch PMIx, which keeps the
+        // legacy path until PMIx-in-Stepd lands.
         let is_direct_pmix_batch =
             spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
-        let stepd_enabled = !is_direct_pmix_batch
-            && std::env::var("SPUR_STEPD")
-                .ok()
-                .is_some_and(|value| value == "1");
+        let stepd_enabled = !is_direct_pmix_batch;
+        #[cfg(test)]
+        let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
+        if is_direct_pmix_batch {
+            warn!(
+                job_id,
+                "direct-launch PMIx job runs unsupervised; it will not survive an agent restart"
+            );
+        }
 
         // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
         // refuse root execution here — before anything is spawned — rather than relying on the
@@ -4305,10 +4321,11 @@ impl SlurmAgent for AgentService {
             "registered srun allocation"
         );
 
-        let stepd_enabled = std::env::var("SPUR_STEPD")
-            .ok()
-            .is_some_and(|value| value == "1");
-        let runtime_descriptor = if stepd_enabled {
+        #[cfg(test)]
+        let supervise_allocation = !self.force_legacy_launch;
+        #[cfg(not(test))]
+        let supervise_allocation = true;
+        let runtime_descriptor = if supervise_allocation {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
                 run_attempt: req.run_attempt,
