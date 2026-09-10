@@ -113,7 +113,19 @@ struct StoreInner {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     applied_count: u64,
+    /// Highest log index present on disk at startup. Everything up to it is
+    /// replayed, not new, thus its side effects must not be reported as
+    /// events that happen now. See [`WAL_REPLAY_SPAN`].
+    #[serde(skip)]
+    replay_upto: Option<u64>,
 }
+
+/// Name of the span that wraps every replayed WAL operation. `spurctld` filters
+/// INFO and below inside it, because a restart re-applies the whole log: without
+/// this, one node removal is reported once per controller process, and a reader
+/// who greps the journal chases a fault that did not happen. WARN and ERROR stay,
+/// because a bad transition during a replay is a real defect.
+pub const WAL_REPLAY_SPAN: &str = "wal_replay";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedSnapshot {
@@ -254,9 +266,12 @@ impl SpurStore {
             );
         }
 
+        inner.replay_upto = inner.log.keys().next_back().copied();
+
         info!(
             log_entries = inner.log.len(),
             vote = ?inner.vote,
+            replay_upto = ?inner.replay_upto,
             "raft store recovered from disk"
         );
         if skipped_records > 0 {
@@ -485,7 +500,18 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
                 EntryPayload::Normal(op) => {
                     debug!(index = entry.log_id.index, "raft: applying WalOperation");
                     inner.applied_count += 1;
-                    results.push(self.applier.apply_operation(op));
+                    // An entry that was already on disk when this process started is
+                    // a replay of history, not something happening now.
+                    let replaying = inner
+                        .replay_upto
+                        .is_some_and(|upto| entry.log_id.index <= upto);
+                    if replaying {
+                        let span = tracing::info_span!(WAL_REPLAY_SPAN, index = entry.log_id.index);
+                        let _enter = span.enter();
+                        results.push(self.applier.apply_operation(op));
+                    } else {
+                        results.push(self.applier.apply_operation(op));
+                    }
                 }
                 EntryPayload::Membership(mem) => {
                     inner.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
@@ -1397,6 +1423,34 @@ mod tests {
         let mut store2 = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
         let state = store2.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id, Some(log_id));
+    }
+
+    /// Everything on disk at startup is history, thus its log events must be
+    /// marked as a replay. A fresh store replays nothing.
+    #[test]
+    fn replay_upto_is_the_highest_index_on_disk() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+            assert_eq!(store.inner.read().replay_upto, None, "fresh store");
+            for index in [3u64, 17, 9] {
+                store
+                    .persist_log_entry(&Entry {
+                        log_id: LogId {
+                            leader_id: openraft::LeaderId {
+                                term: 1,
+                                node_id: 1,
+                            },
+                            index,
+                        },
+                        payload: EntryPayload::Blank,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let restarted = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        assert_eq!(restarted.inner.read().replay_upto, Some(17));
     }
 
     #[test]

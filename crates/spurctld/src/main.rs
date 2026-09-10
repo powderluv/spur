@@ -65,6 +65,36 @@ struct Args {
     allow_partial_wal_recovery: bool,
 }
 
+/// Install the log subscriber, and drop INFO and below inside the WAL replay
+/// span. A restart re-applies the whole log, thus without this filter one node
+/// removal or one partition change is printed again on every start, and a
+/// reader who greps the journal chases a fault that did not happen. WARN and
+/// ERROR pass, because a bad transition during a replay is a real defect.
+fn init_tracing(log_level: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| log_level.parse().unwrap());
+
+    let quiet_replay = tracing_subscriber::filter::DynFilterFn::new(|meta, cx| {
+        if *meta.level() > tracing::Level::WARN {
+            if let Some(span) = cx.lookup_current() {
+                if span.scope().any(|s| s.name() == raft::WAL_REPLAY_SPAN) {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_filter(quiet_replay))
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args_os()
@@ -77,12 +107,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.parse().unwrap()),
-        )
-        .init();
+    init_tracing(&args.log_level);
 
     info!(version = %spur_core::version::version_string(), "spurctld starting");
 
