@@ -317,3 +317,9 @@ Apptainer
 tmpfs
 uncontained
 cgroup's
+CNIs
+ENI
+IPIP
+VNIC
+subnet
+unencapsulated

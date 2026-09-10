@@ -59,13 +59,17 @@ mod local_path_tests {
     }
 }
 
-/// Generate a k0s controller config (YAML) for a Calico cluster. `api_address` is where the API
-/// server is advertised — the control-plane's WireGuard mesh IP when `mesh_native`, else its real
-/// underlay address. `mesh_native` also picks Calico's mode: `bird` (native routing over the mesh,
-/// no overlay) when true, else `vxlan` (Calico's own overlay — no mesh required). `cni_mtu` sets
-/// Calico's MTU (typically below the underlay to leave room for encapsulation overhead, avoiding
-/// fragmentation). Returns `None` for any `cni` other than `"calico"` (the k0s default, kube-router,
-/// needs no config file). `sans` are extra API-server certificate SANs.
+/// Generate a k0s controller config (YAML). `api_address` is where the API server is advertised —
+/// the control-plane's WireGuard mesh IP when `mesh_native`, else its real underlay address.
+/// `mesh_native` also picks Calico's mode: `bird` (native routing over the mesh, no overlay) when
+/// true, else `vxlan` (Calico's own overlay — no mesh required). `cni_mtu` sets Calico's MTU
+/// (typically below the underlay to leave room for encapsulation overhead, avoiding fragmentation).
+/// Returns `None` for an unknown `cni`. `sans` are extra API-server certificate SANs.
+///
+/// kube-router runs with `overlay-type=full`: its default (`subnet`) routes pod packets unencapsulated
+/// between nodes of the same subnet, and a cloud VNIC (OCI, AWS, ...) drops packets whose source is a
+/// pod address unless source/destination checking is disabled on the interface. Full overlay puts every
+/// pod packet in the IPIP tunnel with the node address outside, which works on any underlay.
 ///
 /// For a multi-CP cluster (`cp_count > 1`) no VIP can float over the mesh's cryptokey routing (`bird`
 /// mode) or Calico's own overlay (`vxlan` mode), so node-local load balancing (EnvoyProxy) is enabled
@@ -81,7 +85,7 @@ pub fn k0s_controller_config_yaml(
     cp_count: usize,
     mesh_native: bool,
 ) -> Option<String> {
-    if cni != "calico" {
+    if cni != "calico" && cni != "kuberouter" {
         return None;
     }
     let mut y = String::new();
@@ -99,13 +103,19 @@ pub fn k0s_controller_config_yaml(
         }
     }
     y.push_str("  network:\n");
-    y.push_str("    provider: calico\n");
+    y.push_str(&format!("    provider: {cni}\n"));
     y.push_str(&format!("    podCIDR: {pod_cidr}\n"));
     y.push_str(&format!("    serviceCIDR: {service_cidr}\n"));
-    y.push_str("    calico:\n");
-    let mode = if mesh_native { "bird" } else { "vxlan" };
-    y.push_str(&format!("      mode: {mode}\n"));
-    y.push_str(&format!("      mtu: {cni_mtu}\n"));
+    if cni == "calico" {
+        y.push_str("    calico:\n");
+        let mode = if mesh_native { "bird" } else { "vxlan" };
+        y.push_str(&format!("      mode: {mode}\n"));
+        y.push_str(&format!("      mtu: {cni_mtu}\n"));
+    } else {
+        y.push_str("    kuberouter:\n");
+        y.push_str("      extraArgs:\n");
+        y.push_str("        overlay-type: full\n");
+    }
     if cp_count > 1 {
         y.push_str("    nodeLocalLoadBalancing:\n");
         y.push_str("      enabled: true\n");
@@ -225,8 +235,8 @@ mod k0s_config_tests {
     }
 
     #[test]
-    fn kuberouter_default_generates_no_config() {
-        assert!(k0s_controller_config_yaml(
+    fn kuberouter_config_pins_cidrs_and_full_overlay() {
+        let y = k0s_controller_config_yaml(
             "kuberouter",
             "192.0.2.0/24",
             "198.51.100.0/24",
@@ -235,6 +245,27 @@ mod k0s_config_tests {
             &[],
             3,
             true,
+        )
+        .unwrap();
+        assert!(y.contains("provider: kuberouter"));
+        assert!(y.contains("podCIDR: 192.0.2.0/24"));
+        assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
+        // Unencapsulated same-subnet pod routing is dropped by cloud VNIC source checks.
+        assert!(y.contains("overlay-type: full"));
+        assert!(!y.contains("calico"));
+    }
+
+    #[test]
+    fn unknown_cni_generates_no_config() {
+        assert!(k0s_controller_config_yaml(
+            "flannel",
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            1450,
+            "192.0.2.1",
+            &[],
+            1,
+            false,
         )
         .is_none());
     }

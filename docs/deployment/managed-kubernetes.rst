@@ -178,7 +178,28 @@ Networking / CNI
 ~~~~~~~~~~~~~~~~~
 
 **kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
-on the node's primary interface and workers join over it. No mesh required.
+on the node's primary interface and workers join over it. No mesh required. SPUR runs
+kube-router with ``overlay-type=full``, so every pod packet travels in the IPIP tunnel
+with the node address on the outside. kube-router's own default (``subnet``) sends pod
+packets unencapsulated between nodes of the same subnet, and a cloud NIC (OCI VNIC, AWS
+ENI, ...) drops a packet whose source is a pod address unless source/destination checking
+is disabled on the interface. Full overlay works on any underlay, at the cost of the IPIP
+header between same-subnet nodes. The tunnel is IP protocol 4 (IPIP) between nodes, and
+kube-router peers over BGP (TCP 179); open both if a host or cloud firewall (OCI security
+list, AWS security group, ...) default-denies them.
+
+``pod_cidr`` and ``service_cidr`` from ``[cluster]`` apply to both CNIs.
+
+.. note::
+
+   Clusters built by a SPUR release before 0.12 with ``cni = "kuberouter"`` run on the k0s
+   default CIDRs (``10.244.0.0/16`` pods, ``10.96.0.0/12`` services) in ``subnet`` overlay
+   mode. The k0s config is rendered once per control plane when it first starts, so those
+   nodes keep running as they are. A control plane added or re-joined later receives the
+   ``[cluster]`` CIDRs, and k0s requires the same CIDRs on every control plane. To move such
+   a cluster to the pinned CIDRs and full overlay, reprovision it (``spur k8s down --reset``
+   then ``spur k8s up``), or set ``pod_cidr = "10.244.0.0/16"`` and
+   ``service_cidr = "10.96.0.0/12"`` before adding control planes.
 
 **calico** (``cni = "calico"``) — with the WireGuard mesh enabled
 (``network.wg_enabled = true``), ``spur k8s up`` generates a k0s config that
