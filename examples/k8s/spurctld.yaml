@@ -25,6 +25,8 @@ metadata:
   namespace: spur
 spec:
   serviceName: spurctld
+  # Fixed at first apply. Raising this later makes the new, empty replicas try to
+  # form a second Raft cluster, and spurctld refuses to start rather than do it.
   replicas: 3
   podManagementPolicy: Parallel
   selector:
