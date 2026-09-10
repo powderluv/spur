@@ -3304,17 +3304,19 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // Every job is supervised except direct-launch PMIx, which keeps the
-        // legacy path until PMIx-in-Stepd lands.
+        // Every job is supervised except direct-launch PMIx and pty launches,
+        // which keep the legacy path until the supervisor handles them.
         let is_direct_pmix_batch =
             spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
-        let stepd_enabled = !is_direct_pmix_batch;
+        let unsupervised_launch = is_direct_pmix_batch || spec.pty;
+        let stepd_enabled = !unsupervised_launch;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
-        if is_direct_pmix_batch {
+        if unsupervised_launch {
             warn!(
                 job_id,
-                "direct-launch PMIx job runs unsupervised; it will not survive an agent restart"
+                pty = spec.pty,
+                "job runs unsupervised; it will not survive an agent restart"
             );
         }
 
