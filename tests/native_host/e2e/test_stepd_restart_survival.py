@@ -55,18 +55,30 @@ class TestStepdRestartSurvival:
     # The session is the agent's only record of the job, so a completed one
     # must not be left behind to be rediscovered on the next restart.
     def test_a_completed_jobs_session_is_pruned(self, cluster):
-        before = set(_sessions(cluster))
+        # Long enough to observe the session while it exists: a job that has
+        # already exited cannot distinguish "pruned" from "never created".
+        script = cluster.write_file(
+            "stepd-prune.sh",
+            "#!/bin/bash\nsleep 20\n",
+            all_nodes=True,
+        )
         job_id = parse_job_id(
-            cluster.sbatch(
-                ["-J", "stepd-prune", "-w", cluster.node_names[0], "--wrap", "true"]
-            )
+            cluster.sbatch(["-J", "stepd-prune", "-w", cluster.node_names[0], script])
         )
         assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+
+        prefix = f"{job_id}."
+        assert [name for name in _sessions(cluster) if name.startswith(prefix)], (
+            f"expected a runtime session for job {job_id} while it runs, "
+            f"saw {_sessions(cluster)} under {cluster.state_dir}/runtime"
+        )
+
         assert wait_job(cluster, job_id, timeout=120) == "CD"
 
         deadline = time.time() + 60
         while time.time() < deadline:
-            if not set(_sessions(cluster)) - before:
+            if not [name for name in _sessions(cluster) if name.startswith(prefix)]:
                 return
             time.sleep(2)
         assert False, f"session for job {job_id} was never pruned: {_sessions(cluster)}"
