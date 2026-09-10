@@ -1492,11 +1492,14 @@ impl SlurmController for ControllerService {
         if self.cluster.get_node(&req.hostname).is_none() {
             return Ok(Response::new(()));
         }
+        // A stopping agent is Down, not gone. Deleting the record here would
+        // drop the node from the WireGuard membership, every other node would
+        // prune its peer, and the node could not register again over the mesh
+        // after a reboot. See `ClusterManager::mark_node_down`.
         let evicted = self
             .cluster
-            .remove_node(
+            .mark_node_down(
                 &req.hostname,
-                true,
                 Some(req.reason.clone()).filter(|r| !r.is_empty()),
             )
             .map_err(|e| Status::internal(e.to_string()))?;

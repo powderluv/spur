@@ -3162,6 +3162,63 @@ impl ClusterManager {
         })
     }
 
+    /// Mark a node Down because its agent is stopping (reboot, service restart).
+    /// Returns finalized jobs from eviction so callers can send cancel RPCs.
+    ///
+    /// An agent that stops is down, not gone: the node record — with its
+    /// `wg_pubkey` and mesh IP — is what holds the WireGuard membership
+    /// together (`cluster_k8s::mesh_from_nodes`), and removing it makes every
+    /// other node prune this node's peer, which leaves the node unable to
+    /// register again over the mesh it needs. The record therefore stays, and
+    /// `check_node_health` recovers the node when its heartbeat returns.
+    /// Removal stays an operator action (`spur node remove`, `spur k8s down`).
+    pub fn mark_node_down(
+        &self,
+        name: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<Vec<JobFinalized>> {
+        // An admin hold's reason, lock and attribution outrank the shutdown
+        // reason, so an operator's drain is not silently cleared when the
+        // agent restarts. Otherwise this is a system action: uid 0, now.
+        let (old_state, admin_locked, reason, reason_uid, reason_time) = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
+            if node.admin_locked && node.state_reason.is_some() {
+                (
+                    node.state,
+                    node.admin_locked,
+                    node.state_reason.clone(),
+                    node.reason_uid,
+                    node.reason_time,
+                )
+            } else {
+                (
+                    node.state,
+                    node.admin_locked,
+                    reason,
+                    Some(0),
+                    Some(Utc::now()),
+                )
+            }
+        };
+        let resp = self.propose(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state,
+            new_state: NodeState::Down,
+            reason,
+            admin_locked,
+            reason_uid,
+            reason_time,
+        })?;
+        self.k8s_metrics
+            .set_node_up(&self.config().cluster_name, name, false);
+        self.run_all_finalized_side_effects(&resp);
+        info!(node = %name, "node marked DOWN (agent shutdown), record kept");
+        Ok(resp.jobs_finalized)
+    }
+
     /// Remove a node from the cluster. If `force`, evict running jobs first.
     /// Returns finalized jobs from eviction so callers can send cancel RPCs.
     pub fn remove_node(
@@ -23850,6 +23907,43 @@ mod tests {
         cm.remove_node("n1", true, Some("bad node".into())).unwrap();
         wait_for("n1 removed", || cm.get_node("n1").is_none());
 
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+    }
+
+    /// A stopping agent must not delete its node: the record carries the
+    /// `wg_pubkey` that keeps the node in the WireGuard membership, and
+    /// without it every other node prunes the peer and the node cannot
+    /// register again after a reboot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_shutdown_marks_node_down_and_keeps_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.update_node_wg_pubkey("n1", "pubkey1");
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        cm.mark_node_down("n1", Some("agent shutdown".into()))
+            .unwrap();
+        wait_for("n1 down", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        let node = cm.get_node("n1").expect("node must survive a shutdown");
+        assert_eq!(node.wg_pubkey.as_deref(), Some("pubkey1"));
+        assert!(!node.admin_locked, "must stay recoverable on heartbeat");
+        assert_eq!(node.state_reason.as_deref(), Some("agent shutdown"));
+        assert_eq!(
+            node.reason_uid,
+            Some(0),
+            "system action is attributed to root"
+        );
+        assert!(
+            node.reason_time.is_some(),
+            "system action carries a timestamp"
+        );
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
     }
 
