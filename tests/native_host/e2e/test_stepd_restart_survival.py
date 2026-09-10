@@ -9,8 +9,12 @@ from cluster import parse_job_id, job_state, wait_job, wait_job_state
 
 
 def _supervisors(cluster, node_index: int = 0) -> int:
+    return len(_supervisor_pids(cluster, node_index))
+
+
+def _supervisor_pids(cluster, node_index: int = 0) -> set[str]:
     node = cluster.nodes[node_index]
-    return int(node.exec("pgrep -x spurstepd | wc -l").strip())
+    return set(node.exec_allow_fail("pgrep -x spurstepd || true").split())
 
 
 def _sessions(cluster, node_index: int = 0) -> list[str]:
@@ -38,19 +42,29 @@ class TestStepdRestartSurvival:
         )
         assert job_id is not None
         wait_job_state(cluster, job_id, "R")
-        assert _supervisors(cluster) >= 1, "a running job must have a supervisor"
+        # Identity, not count: a supervisor killed with the agent and respawned
+        # afterwards would satisfy any "still one running" check.
+        before = _supervisor_pids(cluster)
+        assert before, "a running job must have a supervisor"
 
         cluster.restart_agent(0)
 
-        assert _supervisors(cluster) >= 1, (
-            "the supervisor must outlive the agent that spawned it"
+        after = _supervisor_pids(cluster)
+        assert before <= after, (
+            "the supervisor must outlive the agent that spawned it: "
+            f"{sorted(before)} before the restart, {sorted(after)} after"
         )
         assert job_state(cluster.squeue_all(), job_id) == "R", (
             "the job must still be running after its agent restarted"
         )
 
         assert wait_job(cluster, job_id, timeout=180) == "CD"
-        assert "SURVIVED" in cluster.nodes[0].exec(f"cat '{out_path}'")
+        content = cluster.nodes[0].exec(f"cat '{out_path}'")
+        assert "SURVIVED" in content
+        # A relaunched job would replay its output from the top.
+        assert content.count("tick 1\n") == 1, (
+            f"the job must not have been restarted:\n{content}"
+        )
 
     # The session is the agent's only record of the job, so a completed one
     # must not be left behind to be rediscovered on the next restart.
