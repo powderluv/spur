@@ -113,4 +113,7 @@ class TestSrunInBatch:
         wait_job(cluster, job_id, timeout=90)
         content = cluster.read_output_on_any_node(out_path)
         lines = sorted({ln for ln in content.splitlines() if ln.startswith("host=")})
-        assert len(lines) == 2, f"expected 2 step task lines in batch output:\n{content}"
+        assert len(lines) == 2, (
+            f"expected 2 step task lines in batch output:\n{content}\n"
+            f"{cluster.debug_job(job_id)}"
+        )

@@ -3841,6 +3841,7 @@ dependencies = [
  "anyhow",
  "spurd",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
