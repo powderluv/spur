@@ -185,15 +185,16 @@ struct Args {
     state_dir: Option<String>,
 }
 
-/// Parses a stepd directory's `<job_id>.<run_attempt>.<step_id>` basename.
-/// Used to fence a session whose descriptor failed to parse — the full
-/// identity survives in the directory name even when its contents don't.
+/// Identity of a session whose descriptor failed to parse. The directory is
+/// named `<job>.<attempt>.<step>`, so it still names the session.
 fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32, spur_core::step::StepId)> {
-    let name = path.file_name()?.to_str()?;
-    let mut parts = name.splitn(3, '.');
+    let mut parts = path.file_name()?.to_str()?.split('.');
     let job_id = parts.next()?.parse().ok()?;
     let run_attempt = parts.next()?.parse().ok()?;
     let step_id = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some((job_id, run_attempt, step_id))
 }
 
@@ -867,16 +868,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_dir_name_reads_the_full_identity() {
+    fn session_dir_name_reads_job_attempt_and_step() {
         assert_eq!(
-            parse_session_dir_name(std::path::Path::new("42.1.4294967295")),
+            parse_session_dir_name(std::path::Path::new("/run/spur/runtime/42.1.4294967295")),
             Some((42, 1, 4294967295))
         );
     }
 
     #[test]
-    fn parse_session_dir_name_rejects_a_two_component_name() {
-        assert_eq!(parse_session_dir_name(std::path::Path::new("42.1")), None);
+    fn session_dir_name_rejects_names_that_are_not_a_session() {
+        for name in ["agent.sock", "42.1", "42.1.7.9", "42.one.7"] {
+            assert_eq!(
+                parse_session_dir_name(std::path::Path::new(name)),
+                None,
+                "{name} should not parse as a session"
+            );
+        }
     }
 
     #[test]

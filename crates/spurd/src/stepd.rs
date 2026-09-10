@@ -286,10 +286,14 @@ impl StepdObligationLog {
             )
         })?;
         entry.push(b'\n');
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&self.path)?;
         file.write_all(&entry)?;
         file.sync_data()
     }
@@ -337,8 +341,8 @@ where
     Ok(n)
 }
 
-/// Sibling of the stepd store root, not inside it, so directory
-/// scans over session state (`discover_live`, `prune_finalized`) never see it.
+/// Lives in the stepd store root but is not a directory, so the session walk
+/// (`discover_live`, `prune_finalized`) never reaches it.
 pub const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
 const STEPD_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -610,6 +614,19 @@ fn prune_finalized_session(
     }
     fs::remove_dir_all(session_dir)?;
     Ok(true)
+}
+
+/// Session records carry the job's environment, so they are owner-only.
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)
 }
 
 pub fn validate_hello(
@@ -1147,7 +1164,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if let Err(error) = result {
         teardown(cgroup).await;
         let failure_path = session_dir.join(FAILURE_FILE);
-        if let Err(write_error) = std::fs::write(&failure_path, error.to_string()) {
+        if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
             tracing::warn!(%write_error, path = %failure_path.display(), "failed to record stepd failure");
         }
         return Err(error.into());
@@ -1294,7 +1311,8 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> PathBuf {
-        self.root.join(format!("{job_id}.{run_attempt}.{step_id}"))
+        self.root
+            .join(format!("{}.{}.{}", job_id, run_attempt, step_id))
     }
 
     pub fn obligations(
@@ -1350,10 +1368,14 @@ impl StepdStore {
                 format!("serialize runtime descriptor: {error}"),
             )
         })?;
-        let mut temporary = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut temporary = options.open(&temporary_path)?;
         temporary.write_all(&contents)?;
         temporary.sync_all()?;
         drop(temporary);
@@ -1361,36 +1383,26 @@ impl StepdStore {
         fs::File::open(session_dir)?.sync_all()
     }
 
-    pub fn discover_live(&self) -> io::Result<DiscoveredStepds> {
+    /// Every session directory: runtime/<job>.<attempt>.<step>. The notification
+    /// socket shares the root, so anything that is not a directory is skipped.
+    fn session_dirs(&self) -> io::Result<Vec<PathBuf>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(DiscoveredStepds {
-                    live: Vec::new(),
-                    stale: Vec::new(),
-                    rejected: Vec::new(),
-                });
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
+        Ok(entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect())
+    }
 
+    pub fn discover_live(&self) -> io::Result<DiscoveredStepds> {
         let mut live = Vec::new();
         let mut stale = Vec::new();
         let mut rejected = Vec::new();
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    rejected.push((self.root.clone(), error.to_string()));
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if !entry.file_type()?.is_dir() {
-                rejected.push((path, "stepd entry is not a directory".into()));
-                continue;
-            }
-
+        for path in self.session_dirs()? {
             match self.load_descriptor(&path) {
                 Ok(descriptor) => match stepd_liveness(&descriptor) {
                     Ok(StepdLiveness::Live) => live.push(descriptor),
@@ -1409,18 +1421,8 @@ impl StepdStore {
     }
 
     pub fn discover_unacknowledged_completions(&self) -> io::Result<Vec<PendingStepdCompletion>> {
-        let entries = match fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
         let mut completions = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let session_dir = entry.path();
+        for session_dir in self.session_dirs()? {
             let descriptor = match self.load_descriptor(&session_dir) {
                 Ok(descriptor) => descriptor,
                 Err(_) => continue,
@@ -1466,19 +1468,8 @@ impl StepdStore {
     }
 
     pub fn prune_finalized(&self) -> io::Result<usize> {
-        let entries = match fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error),
-        };
-
         let mut pruned = 0;
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let session_dir = entry.path();
+        for session_dir in self.session_dirs()? {
             let descriptor = match self.load_descriptor(&session_dir) {
                 Ok(descriptor) => descriptor,
                 Err(_) => continue,
@@ -2457,6 +2448,48 @@ mod tests {
             .await
             .expect("poll teardown completion");
         assert!(!session.snapshot().await.active);
+    }
+
+    #[test]
+    fn a_session_is_one_directory_per_job_step_with_private_records() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.step_id = 7;
+        descriptor.socket_path = store.session_dir(42, 3, 7).join("runtime.sock");
+        store.publish(&descriptor).expect("publish");
+
+        let session = temp.path().join("runtime").join("42.3.7");
+        assert!(session.is_dir(), "a session is one directory per job.step");
+        let mode = fs::metadata(session.join(DESCRIPTOR_FILE))
+            .expect("descriptor")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "session records are owner-only");
+
+        // A second step of the same job must sit beside the first, not replace it.
+        let mut sibling = descriptor.clone();
+        sibling.step_id = 8;
+        sibling.socket_path = store.session_dir(42, 3, 8).join("runtime.sock");
+        store.publish(&sibling).expect("publish sibling");
+        assert!(session.is_dir());
+        assert!(temp.path().join("runtime/42.3.8").is_dir());
+
+        // The notification socket shares the root with the sessions.
+        fs::write(store.agent_socket(), b"").expect("agent socket");
+
+        let found = store.discover_live().expect("discover");
+        assert!(found.rejected.is_empty(), "no stray entries: {found:?}");
+        let mut steps: Vec<_> = found
+            .live
+            .iter()
+            .chain(found.stale.iter())
+            .map(|d| d.step_id)
+            .collect();
+        steps.sort_unstable();
+        assert_eq!(steps, vec![7, 8], "discovery must reach every step");
     }
 
     #[test]
