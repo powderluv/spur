@@ -3,6 +3,7 @@
 
 mod agent;
 mod auth_middleware;
+mod controller;
 mod crd;
 mod health;
 mod heartbeat;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod agent;
+pub mod controller;
 pub mod crd;
 pub mod health;
 pub mod heartbeat;

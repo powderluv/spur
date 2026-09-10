@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::pin::pin;
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures_util::TryStreamExt;
 use k8s_openapi::api::core::v1::Node as K8sNode;
 use kube::api::Api;
@@ -105,7 +106,7 @@ pub async fn run(
 
     info!(selector = %label_selector, "starting K8s node watcher");
 
-    let mut ctrl_client = connect_controller(&controller_addr).await?;
+    let mut ctrl_client = crate::controller::connect(&controller_addr).await?;
     let mut fingerprints: HashMap<String, u64> = HashMap::new();
     let mut taint_states: HashMap<String, NodeTaintState> = HashMap::new();
 
@@ -122,8 +123,6 @@ pub async fn run(
                 let fp = fingerprint(&resources);
 
                 if fingerprints.get(&name) != Some(&fp) {
-                    fingerprints.insert(name.clone(), fp);
-
                     info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
@@ -137,15 +136,16 @@ pub async fn run(
                         join_token: String::new(),
                     };
 
-                    match ctrl_client.register_agent(req.clone()).await {
-                        Ok(_) => {
-                            debug!(node = %name, "K8s node registered with spurctld");
-                            hb.track(name.clone(), req).await;
-                        }
-                        Err(e) => {
-                            error!(node = %name, error = %e, "failed to register K8s node")
-                        }
-                    }
+                    // A refused registration ends the watcher. Its retry loop
+                    // restarts it and lists every node again, which is the only
+                    // way to try again before the node's next event.
+                    ctrl_client
+                        .register_agent(req.clone())
+                        .await
+                        .with_context(|| format!("register K8s node {name}"))?;
+                    debug!(node = %name, "K8s node registered with spurctld");
+                    hb.track(name.clone(), req).await;
+                    fingerprints.insert(name.clone(), fp);
                 }
 
                 let entry = taint_states.entry(name.clone()).or_insert(NodeTaintState {
@@ -286,19 +286,6 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
         gpus,
         generic: Default::default(),
     }
-}
-
-async fn connect_controller(addr: &str) -> anyhow::Result<SlurmControllerClient<Channel>> {
-    let url = if addr.starts_with("http") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    };
-    let client = SlurmControllerClient::connect(url)
-        .await?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
-    Ok(client)
 }
 
 #[cfg(test)]

@@ -14,8 +14,6 @@ use axum::Router;
 use kube::Client;
 use tracing::{debug, info};
 
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-
 struct HealthState {
     k8s_client: Client,
     controller_addr: String,
@@ -55,12 +53,9 @@ async fn readyz(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
     let k8s_ok = state.k8s_client.apiserver_version().await.is_ok();
 
     // Check spurctld reachability
-    let url = if state.controller_addr.starts_with("http") {
-        state.controller_addr.clone()
-    } else {
-        format!("http://{}", state.controller_addr)
-    };
-    let ctrl_ok = SlurmControllerClient::connect(url).await.is_ok();
+    let ctrl_ok = crate::controller::connect(&state.controller_addr)
+        .await
+        .is_ok();
 
     if k8s_ok && ctrl_ok {
         debug!("readyz: ok");
