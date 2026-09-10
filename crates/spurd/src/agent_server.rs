@@ -297,20 +297,33 @@ async fn stop_stepd_process(descriptor: &crate::stepd::StepdDescriptor) -> std::
     }
 }
 
-/// Whether a torn-down stepd is confirmed dead. A cgroup path, if
-/// recorded, is authoritative — a successful stop signal only reaches the
-/// supervisor, which by design ignores a raw SIGTERM for its job's cgroup.
+/// The supervisor publishes its cgroup only once the launch returns, so a
+/// descriptor read before that carries none — derive it from the job identity.
+fn effective_cgroup_path(descriptor: &crate::stepd::StepdDescriptor) -> std::path::PathBuf {
+    if descriptor.cgroup_path.as_os_str().is_empty() {
+        executor::expected_cgroup_path(descriptor.job_id, descriptor.run_attempt)
+    } else {
+        descriptor.cgroup_path.clone()
+    }
+}
+
+/// Whether a torn-down stepd is confirmed dead. A recorded cgroup path is
+/// authoritative — a successful stop signal only reaches the supervisor, which
+/// by design ignores a raw SIGTERM for its job's cgroup.
 async fn runtime_teardown_confirmed(
-    cgroup_path: &std::path::Path,
+    descriptor: &crate::stepd::StepdDescriptor,
     stop_result: &std::io::Result<()>,
 ) -> bool {
-    if cgroup_path.as_os_str().is_empty() {
+    // A derived path is still worth reaping — the supervisor may have created
+    // the cgroup before dying — but its absence proves nothing, since it may
+    // never have existed, so confirmation falls back to the stop.
+    if descriptor.cgroup_path.as_os_str().is_empty() {
+        runtime_cgroup_reaped(&effective_cgroup_path(descriptor));
         return stop_result.is_ok();
     }
-    crate::executor::cleanup_cgroup(cgroup_path);
     // The retrying rmdir only succeeds once the cgroup is empty, so its
     // absence is what confirms the job's processes are actually gone.
-    !cgroup_path.exists()
+    runtime_cgroup_reaped(&descriptor.cgroup_path)
 }
 
 /// Reap a supervisor's cgroup and report whether it is confirmed gone.
@@ -403,7 +416,7 @@ async fn fence_displaced_stepd(
     };
     displaced_runtime_attempt(&displaced, run_attempt)?;
     let stop_result = stop_stepd_process(&displaced).await;
-    if !runtime_teardown_confirmed(&displaced.cgroup_path, &stop_result).await {
+    if !runtime_teardown_confirmed(&displaced, &stop_result).await {
         return match stop_result {
             Err(error) => Err(error),
             Ok(()) => Err(std::io::Error::other(
@@ -818,7 +831,7 @@ impl StepdRecoveryCleanup {
                 "failed to stop controller-rejected stepd"
             );
         }
-        if !runtime_teardown_confirmed(&descriptor.cgroup_path, &stop_result).await {
+        if !runtime_teardown_confirmed(descriptor, &stop_result).await {
             // Can't confirm the old attempt is actually gone — releasing
             // tracking now would let a new attempt double-book resources
             // it's still using.
@@ -1179,9 +1192,7 @@ async fn fence_dead_stepd(
     // The crashed supervisor was the cgroup's only owner, so its job process
     // can outlive it as an orphan — reap it before releasing this node's ledger.
     // No unit is left to retry stopping, so an unconfirmed cgroup still proceeds.
-    if !descriptor.cgroup_path.as_os_str().is_empty()
-        && !runtime_cgroup_reaped(&descriptor.cgroup_path)
-    {
+    if !runtime_cgroup_reaped(&effective_cgroup_path(&descriptor)) {
         warn!(
             job_id = descriptor.job_id,
             run_attempt = descriptor.run_attempt,
@@ -3879,14 +3890,7 @@ impl SlurmAgent for AgentService {
                         }
                         // This session never entered `stepds`, so the
                         // crash watchdog will never see it either — reap it here.
-                        let cgroup_path = if descriptor.cgroup_path.as_os_str().is_empty() {
-                            executor::expected_cgroup_path(
-                                descriptor.job_id,
-                                descriptor.run_attempt,
-                            )
-                        } else {
-                            descriptor.cgroup_path.clone()
-                        };
+                        let cgroup_path = effective_cgroup_path(&descriptor);
                         if !runtime_cgroup_reaped(&cgroup_path) {
                             warn!(
                                 job_id,
@@ -4000,7 +4004,26 @@ impl SlurmAgent for AgentService {
                     if let Err(error) =
                         crate::stepd::start_job(descriptor, uuid::Uuid::new_v4().to_string()).await
                     {
+                        // The gate is still shut, so nothing ran: fail the launch
+                        // rather than leave the controller holding a job whose
+                        // workload never starts.
                         warn!(job_id, run_attempt, %error, "failed to release the supervised job");
+                        let _ = stop_stepd_process(descriptor).await;
+                        release_stepd_tracking(
+                            &self.running,
+                            &self.allocation,
+                            &self.stepds,
+                            descriptor,
+                            "supervised job could not be released",
+                        )
+                        .await;
+                        return Ok(Response::new(LaunchJobResponse {
+                            success: false,
+                            error: format!("failed to release the supervised job: {error}"),
+                            stdout_path: String::new(),
+                            stderr_path: String::new(),
+                            failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                        }));
                     }
                 }
                 // Already claimed into `stepds` above, before the
@@ -7294,7 +7317,18 @@ mod tests {
         std::fs::create_dir(cgroup.path().join("cgroup.kill"))
             .expect("seed a permanent cgroup.kill blocker");
 
-        let confirmed = runtime_teardown_confirmed(cgroup.path(), &Ok(())).await;
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.cgroup_path = cgroup.path().to_path_buf();
+
+        let confirmed = runtime_teardown_confirmed(&descriptor, &Ok(())).await;
 
         assert!(
             !confirmed,
@@ -7302,14 +7336,25 @@ mod tests {
         );
     }
 
+    // A descriptor read before the supervisor published its cgroup carries none.
+    // The derived path's absence proves nothing, so the stop decides.
     #[tokio::test]
     async fn runtime_teardown_confirmed_trusts_stop_result_when_there_is_no_cgroup() {
-        let empty_path = std::path::PathBuf::new();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert!(descriptor.cgroup_path.as_os_str().is_empty());
 
-        assert!(runtime_teardown_confirmed(&empty_path, &Ok(())).await);
+        assert!(runtime_teardown_confirmed(&descriptor, &Ok(())).await);
         assert!(
             !runtime_teardown_confirmed(
-                &empty_path,
+                &descriptor,
                 &Err(std::io::Error::other("systemctl stop failed"))
             )
             .await

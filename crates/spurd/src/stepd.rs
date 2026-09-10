@@ -1280,11 +1280,27 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
-    // Hold the workload until spurd has finished its own launch bookkeeping,
-    // so an srun on the script's first line cannot outrun the job's start.
-    tokio::time::timeout(START_GATE_TIMEOUT, await_start(&listener, &descriptor))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))??;
+    // Hold the workload until spurd has finished its own launch bookkeeping, so
+    // an srun on the script's first line cannot outrun the job's start. Only the
+    // launch path releases the gate; an allocation has no workload to hold.
+    if !launch_spec.allocation_only {
+        let gate = tokio::time::timeout(START_GATE_TIMEOUT, await_start(&listener, &descriptor))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))
+            .and_then(|result| result.map_err(anyhow::Error::from));
+        if let Err(error) = gate {
+            // Nothing launched, so only the session's own artifacts need clearing
+            // — but they must be, or the session is never prunable.
+            let _ = std::fs::remove_file(&socket_path);
+            let failure_path = session_dir.join(FAILURE_FILE);
+            if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
+                tracing::warn!(%write_error, path = %failure_path.display(),
+                    "failed to record stepd failure");
+            }
+            crate::executor::cleanup_job_spool(job_id);
+            return Err(error);
+        }
+    }
     let (job, launched_cgroup) = if launch_spec.allocation_only {
         (RunningJob::AllocationOnly, None)
     } else {
@@ -2828,6 +2844,32 @@ mod tests {
             StepdResponse::Acknowledged
         ));
         assert!(server.await.expect("join").expect("serve"));
+    }
+
+    // Start and the readiness probe arrive on separate connections, so the
+    // probe must not hold the gate shut.
+    #[tokio::test]
+    async fn the_gate_releases_when_start_arrives_on_a_second_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        // The probe stays open for the whole test, so a gate that served
+        // connections serially would never see the Start below.
+        let probe = query_state(&descriptor, "probe".into())
+            .await
+            .expect("probe answered while the gate is shut");
+        assert_eq!(probe.job_pid, 0);
+
+        start_job(&descriptor, "release".into())
+            .await
+            .expect("start accepted");
+        gate.await.expect("join").expect("gate released");
     }
 
     // An agent that dies mid-launch must not leave the job released.
