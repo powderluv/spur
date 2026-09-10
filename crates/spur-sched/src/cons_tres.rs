@@ -66,6 +66,29 @@ impl NodeAllocation {
         }
     }
 
+    /// Update total capacity from a re-discovered inventory, preserving current
+    /// allocations. CPUs/memory resize in place; GPUs are re-indexed by device
+    /// id so existing GPU allocations follow their device. A device that
+    /// vanished while allocated stops counting toward the total but its owning
+    /// job is untouched (it releases normally). Without this the agent's local
+    /// capacity stays frozen at startup and rejects launches for GPUs that only
+    /// appeared later (e.g. an SPX->CPX partition change), even after the
+    /// controller has learned about them via re-register.
+    pub fn update_capacity(&mut self, resources: &ResourceSet) {
+        self.total_cpus = resources.cpus;
+        self.allocated_cpus.resize(resources.cpus as usize, false);
+        self.total_memory_mb = resources.memory_mb;
+
+        let allocated_ids: std::collections::HashSet<u32> =
+            self.allocated_gpu_ids().into_iter().collect();
+        self.gpus = resources.gpus.clone();
+        self.gpu_allocated = self
+            .gpus
+            .iter()
+            .map(|g| allocated_ids.contains(&g.device_id))
+            .collect();
+    }
+
     /// Available (unallocated) CPU count.
     pub fn free_cpus(&self) -> u32 {
         self.allocated_cpus.iter().filter(|&&a| !a).count() as u32
@@ -324,6 +347,43 @@ mod tests {
         assert_eq!(node.free_cpus(), 64);
         assert_eq!(node.free_memory_mb(), 256_000);
         assert_eq!(node.free_gpus(None), 8);
+    }
+
+    #[test]
+    fn test_update_capacity_grows_and_preserves_allocations() {
+        // Start with 4 GPUs, allocate two of them, then an inventory refresh
+        // reveals 8 (e.g. SPX->CPX). The new GPUs become schedulable while the
+        // two already allocated stay allocated (by device id).
+        let mut node = make_node(32, 128_000, 4, "mi300x");
+        node.allocate_for_job(1, 8, 0, &[1, 2]).unwrap();
+        assert_eq!(node.free_gpus(None), 2);
+
+        let bigger = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            gpus: (0..8u32)
+                .map(|device_id| GpuResource {
+                    device_id,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        node.update_capacity(&bigger);
+
+        assert_eq!(node.total_cpus, 64);
+        assert_eq!(node.free_memory_mb(), 256_000 - node.allocated_memory_mb);
+        assert_eq!(
+            node.free_gpus(None),
+            6,
+            "4 new GPUs added, 2 still allocated"
+        );
+        assert_eq!(node.allocated_gpu_ids(), vec![1, 2]);
+        // CPU allocation from before is preserved (8 cores still busy).
+        assert_eq!(node.free_cpus(), 64 - 8);
     }
 
     #[test]

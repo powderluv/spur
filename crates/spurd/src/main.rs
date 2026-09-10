@@ -467,6 +467,51 @@ async fn main() -> anyhow::Result<()> {
 
     agent_service.start_monitor(args.controller.clone());
 
+    // Periodically re-discover node inventory. It is otherwise frozen at startup,
+    // so a device count that changes out of band (a GPU partition-mode switch, a
+    // GPU dropping off the bus) never reaches the controller and it keeps
+    // scheduling against hardware that no longer exists. On a change: swap the
+    // shared registry (so injection uses the new set), resize the local
+    // allocation capacity (so this node accepts launches for devices that
+    // appeared), and re-register with the controller.
+    {
+        let reporter = reporter.clone();
+        let registry = registry.clone();
+        let config = config.clone();
+        let allocation = agent_service.allocation_handle();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.tick().await; // the first tick fires immediately; skip it
+                                 // `update_resources` commits the new inventory to the reporter as it
+                                 // detects the change, so a re-register that then fails would never be
+                                 // retried (the next tick sees no further change). Track that a
+                                 // re-register is still owed and keep trying until it lands.
+            let mut reregister_pending = false;
+            loop {
+                ticker.tick().await;
+                let rebuilt = init_device_registry(config.as_ref());
+                let fresh = reporter::discover_resources(&rebuilt);
+                let changed = reporter.update_resources(fresh.clone());
+                if changed {
+                    *registry.lock().await = rebuilt;
+                    allocation.lock().await.update_capacity(&fresh);
+                    reregister_pending = true;
+                }
+                if reregister_pending {
+                    match reporter.register().await {
+                        Ok(()) => {
+                            reregister_pending = false;
+                            info!("node inventory changed; re-registered with the controller")
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "re-register after inventory change failed; will retry")
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
 

@@ -1183,7 +1183,7 @@ impl AgentService {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "unknown".into()),
-            &reporter.resources,
+            &reporter.resources.read().unwrap(),
         );
 
         // Load SPANK plugins from plugstack.conf if available
@@ -1259,6 +1259,14 @@ impl AgentService {
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
     pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
         self.k0s.clone()
+    }
+
+    /// Shared handle to this node's local allocation, so the inventory-refresh
+    /// task can update its capacity (via `update_capacity`) when devices appear
+    /// or vanish. Without it the agent's capacity stays frozen at startup and
+    /// rejects launches for devices the controller has already re-learned.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -2798,9 +2806,9 @@ impl SlurmAgent for AgentService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<NodeResourcesResponse>, Status> {
-        let resources = &self.reporter.resources;
+        let resources = self.reporter.resources.read().unwrap();
         Ok(Response::new(NodeResourcesResponse {
-            total: Some(crate::reporter::resource_to_proto(resources)),
+            total: Some(crate::reporter::resource_to_proto(&resources)),
             used: Some(crate::reporter::allocations_to_proto(
                 &spur_core::resource::ResourceAllocations::default(),
             )),

@@ -31,7 +31,10 @@ impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
 pub struct NodeReporter {
     pub hostname: String,
     pub controller_addr: String,
-    pub resources: ResourceSet,
+    /// Node inventory. Behind a lock so a background refresh can update it live
+    /// (a device count that changes after startup, e.g. a GPU partition-mode
+    /// switch, must reach the controller rather than being frozen at boot).
+    pub resources: std::sync::RwLock<ResourceSet>,
     pub node_address: spur_net::NodeAddress,
     pub labels: HashMap<String, String>,
     pub free_memory_mb: AtomicU64,
@@ -64,7 +67,7 @@ impl NodeReporter {
         Self {
             hostname,
             controller_addr,
-            resources,
+            resources: std::sync::RwLock::new(resources),
             node_address,
             labels,
             free_memory_mb: AtomicU64::new(0),
@@ -94,6 +97,18 @@ impl NodeReporter {
         self.held_jobs.held_job_ids()
     }
 
+    /// Replace the reported inventory if it changed; returns whether it did, so
+    /// the caller can re-register the node with the controller.
+    pub fn update_resources(&self, fresh: ResourceSet) -> bool {
+        let mut cur = self.resources.write().unwrap();
+        if *cur != fresh {
+            *cur = fresh;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Register with the controller.
     pub async fn register(&self) -> anyhow::Result<()> {
         let channel = spur_client::connect_channel(&self.controller_addr)
@@ -101,10 +116,13 @@ impl NodeReporter {
             .context("failed to connect to spurctld for registration")?;
         let mut client = spur_proto::controller_client(channel);
 
+        // Snapshot the inventory before the await so the lock guard is not held
+        // across it (the future must stay Send).
+        let resources = resource_to_proto(&self.resources.read().unwrap());
         let resp = client
             .register_agent(RegisterAgentRequest {
                 hostname: self.hostname.clone(),
-                resources: Some(resource_to_proto(&self.resources)),
+                resources: Some(resources),
                 version: env!("CARGO_PKG_VERSION").into(),
                 address: self.node_address.ip.clone(),
                 port: self.node_address.port as u32,
@@ -574,6 +592,44 @@ mod tests {
 
         let resources = discover_resources(&reg);
         assert_eq!(resources.generic.get("bandwidth:lustre"), Some(&4096));
+    }
+
+    #[test]
+    fn update_resources_reports_only_real_changes() {
+        let held: Arc<dyn HeldJobs> = Arc::new(Mutex::new(HashMap::<u32, ()>::new()));
+        let reporter = NodeReporter::new(
+            "host".into(),
+            "http://controller".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 1000,
+                ..Default::default()
+            },
+            spur_net::address::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "host".into(),
+                port: 6818,
+                source: spur_net::address::AddressSource::Static,
+            },
+            HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            held,
+        );
+
+        // Re-discovering the same inventory is not a change.
+        assert!(!reporter.update_resources(ResourceSet {
+            cpus: 8,
+            memory_mb: 1000,
+            ..Default::default()
+        }));
+        // A changed device/cpu count is, and becomes the new reported inventory.
+        assert!(reporter.update_resources(ResourceSet {
+            cpus: 16,
+            memory_mb: 1000,
+            ..Default::default()
+        }));
+        assert_eq!(reporter.resources.read().unwrap().cpus, 16);
     }
 
     #[test]
