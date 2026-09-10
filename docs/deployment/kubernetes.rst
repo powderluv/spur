@@ -25,18 +25,56 @@ Components
 
 - **spurctld** — Controller. Runs as a StatefulSet with Raft consensus for high availability. Handles accounting (backed by PostgreSQL via ``accounting.database_url``) and serves the Slurm-compatible REST API on port 6820.
 - **spurd** — Node agent. Runs on each compute node (DaemonSet or Deployment).
-- **spur-k8s-operator** — Watches ``SpurJob`` custom resources and submits them to the controller.
+- **spur-k8s-operator** — Watches ``SpurJob`` custom resources, registers the Kubernetes nodes with the controller, and runs each job as a Pod.
 
 Example manifests for production-style deployment live in ``examples/k8s/``.
+
+.. _k8s-two-topologies:
+
+Choose one execution backend
+----------------------------
+
+``spurd.yaml`` and ``operator.yaml`` are **alternatives, not a pair**. Both register the
+Kubernetes nodes with the controller, so applying both makes two agents claim the same
+nodes. Pick one:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Topology
+     - Apply
+     - What runs a job
+   * - **Pod mode** (recommended)
+     - ``operator.yaml``
+     - The operator creates a Pod for each allocated node.
+   * - **Agent mode**
+     - ``spurd.yaml``
+     - spurd runs the job as a process inside its own Pod, as on a bare node.
+
+In Pod mode a job must be a ``SpurJob`` custom resource. The operator finds the job by
+the label ``spur.amd.com/job-id``, which only a ``SpurJob`` carries, so the
+Slurm-compatible CLI (``sbatch``, ``spur submit``) cannot launch work: the job is
+accepted, no Pod is made, and it stays in the queue. Use ``kubectl apply`` of a
+``SpurJob``.
 
 Deploy
 ------
 
 .. note::
 
-   Before applying, review the manifests and update namespaces, image names/tags, resource limits, and storage classes to match your environment. Ensure the ``--controller`` argument in ``spurd.yaml`` includes the ``http://`` scheme (e.g. ``http://spurctld.spur.svc.cluster.local:6817``).
+   Before applying, review the manifests and update namespaces, image names/tags, resource limits, and storage classes to match your environment. In agent mode, ensure the ``--controller`` argument in ``spurd.yaml`` includes the ``http://`` scheme (e.g. ``http://spurctld.spur.svc.cluster.local:6817``).
 
-Apply manifests in order:
+.. warning::
+
+   **Set the final replica count of** ``spurctld`` **before the first apply.** It cannot
+   be raised later. Each new StatefulSet ordinal gets an empty volume from
+   ``volumeClaimTemplates``, and a rolling update starts at the highest ordinal, so new
+   empty replicas would try to form a second Raft cluster before the replica that holds
+   the data is even restarted. spurctld detects this and refuses to start, which leaves
+   the new replicas in ``CrashLoopBackOff``. To change the count, take the cluster down
+   and build it again.
+
+Apply manifests in order (Pod mode):
 
 .. code-block:: bash
 
@@ -45,9 +83,10 @@ Apply manifests in order:
    kubectl apply -f examples/k8s/rbac.yaml
    kubectl apply -f examples/k8s/spurjob-crd.yaml
    kubectl apply -f examples/k8s/spurctld.yaml
-   kubectl apply -f examples/k8s/spurd.yaml
    kubectl apply -f examples/k8s/operator.yaml
    kubectl apply -f examples/k8s/pdb.yaml
+
+For agent mode, apply ``spurd.yaml`` in place of ``operator.yaml``.
 
 Configuration
 -------------
@@ -80,9 +119,13 @@ each entry's host part, so ``controller.node_id`` never needs to be set. Each
 pod's hostname must correspond to its own ``peers`` entry.
 
 Resolution precedence is: explicit ``controller.node_id`` -> position in
-``peers`` -> hostname ordinal. The resolved id must fall within
-``1..=len(peers)``; if a pod's hostname matches no entry (or matches more than
-one), the controller fails fast at startup rather than joining with a wrong ID.
+``peers`` -> hostname ordinal. An explicit id is any positive number. A derived
+id must match a peer entry, or be the next ordinal of the same StatefulSet as a
+peer (``spurctld-3`` with three peers is node 4, a replica that waits to be
+added to the cluster), or, when every peer is an IP address, fall within
+``1..=len(peers)``. Any other derived id, including a hostname that matches more
+than one entry, makes the controller fail fast at startup rather than join with
+a wrong ID.
 
 Adjust partition definitions to match your cluster hardware. Once the controller
 is running, ``scontrol reconfigure`` applies many sections live, while others

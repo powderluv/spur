@@ -9,6 +9,12 @@ service RaftInternal {
   rpc AppendEntries(RaftRequest) returns (RaftResponse);
   rpc Vote(RaftRequest) returns (RaftResponse);
   rpc InstallSnapshot(RaftRequest) returns (RaftResponse);
+  // Asks a peer whether it already belongs to a Raft cluster. A node with an
+  // empty store uses this before it bootstraps, so that a replica added to a
+  // running cluster cannot form a second one. Added after the original three
+  // RPCs: a peer that predates it answers UNIMPLEMENTED, which the caller
+  // reads as "unknown".
+  rpc ClusterProbe(ClusterProbeRequest) returns (ClusterProbeResponse);
 }
 
 message RaftRequest {
@@ -17,4 +23,15 @@ message RaftRequest {
 
 message RaftResponse {
   bytes payload = 1;
+}
+
+message ClusterProbeRequest {}
+
+message ClusterProbeResponse {
+  // True when this node has a membership, that is, it is part of a cluster.
+  bool initialized = 1;
+  // The node ids of the effective membership, voters and learners.
+  repeated uint64 members = 2;
+  // The highest log index this node holds. For the operator, not for a decision.
+  uint64 last_log_index = 3;
 }

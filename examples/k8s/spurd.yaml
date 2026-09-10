@@ -13,7 +13,7 @@ spec:
         app: spurd
     spec:
       nodeSelector:
-        spur.amd.com/compute: "true"
+        spur.amd.com/managed: "true"
       tolerations:
         - key: spur.amd.com/gpu-node
           operator: Exists

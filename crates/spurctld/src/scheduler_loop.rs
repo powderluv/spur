@@ -3445,6 +3445,7 @@ mod tests {
                 licenses: HashMap::new(),
                 burst_buffer: Default::default(),
                 update: Default::default(),
+                probes: Default::default(),
                 metrics: Default::default(),
                 rest_api: Default::default(),
                 hooks: Default::default(),

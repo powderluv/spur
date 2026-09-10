@@ -13,6 +13,14 @@ and the Ansible playbooks that upgrade a running cluster with or without an outa
    binaries on disk — it does **not** restart the daemons. The drain-aware, jobs-preserving
    cluster path is the Ansible ``rolling_upgrade.yml`` playbook (see below).
 
+.. important::
+
+   From this release ``spurctld`` opens a new listener on port **6823** for
+   ``/livez`` and ``/readyz``, bound to every interface. Nothing else changes,
+   and no upgrade step is needed, but a host whose firewall is built from a fixed
+   port list gains a port that no rule covers. Review the rule, or set
+   ``probes.enabled = false`` in ``spur.conf``.
+
 Single-Host: ``spur self-update``
 ---------------------------------
 
