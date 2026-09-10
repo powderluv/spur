@@ -341,8 +341,8 @@ where
     Ok(n)
 }
 
-/// Lives in the stepd store root but is not a directory, so the session walk
-/// (`discover_live`, `prune_finalized`) never reaches it.
+/// Lives in the stepd store root but is not a directory, so the `session_dirs`
+/// walk never reaches it.
 pub const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
 const STEPD_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -626,6 +626,12 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
+    // `mode` only applies on creation, so tighten a record left behind at 0644.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(contents)
 }
 
@@ -1311,8 +1317,7 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> PathBuf {
-        self.root
-            .join(format!("{}.{}.{}", job_id, run_attempt, step_id))
+        self.root.join(format!("{job_id}.{run_attempt}.{step_id}"))
     }
 
     pub fn obligations(
@@ -1393,7 +1398,12 @@ impl StepdStore {
         };
         Ok(entries
             .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter(|entry| match entry.file_type() {
+                Ok(kind) => kind.is_dir(),
+                // Kept so it surfaces as a rejected session and gets fenced,
+                // rather than vanishing from recovery entirely.
+                Err(_) => true,
+            })
             .map(|entry| entry.path())
             .collect())
     }

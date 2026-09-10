@@ -790,18 +790,20 @@ async fn release_stepd_tracking(
     reason: &'static str,
 ) -> bool {
     // The allocation outlives the individual steps drawing on it, so only the
-    // job's last supervisor may release it.
-    let (removed_runtime, was_last_step) = {
-        let mut sessions = stepds.lock().await;
-        let removed = sessions
-            .get(&stepd_key(descriptor))
-            .is_some_and(|current| current == descriptor);
-        if removed {
-            sessions.remove(&stepd_key(descriptor));
-        }
-        let siblings_remain = sessions.keys().any(|(job, _)| *job == descriptor.job_id);
-        (removed, !siblings_remain)
-    };
+    // job's last supervisor releases it. Held across the release so a step
+    // claimed meanwhile cannot have its allocation torn down underneath it.
+    let mut sessions = stepds.lock().await;
+    let removed_runtime = sessions
+        .get(&stepd_key(descriptor))
+        .is_some_and(|current| current == descriptor);
+    if removed_runtime {
+        sessions.remove(&stepd_key(descriptor));
+    }
+    // Scoped to this attempt: a leftover session from a superseded one has no
+    // claim on the allocation, and would otherwise strand it for good.
+    let was_last_step = !sessions.values().any(|other| {
+        other.job_id == descriptor.job_id && other.run_attempt == descriptor.run_attempt
+    });
 
     // Hold `running` across the allocation release too — matching the
     // lock order commit_job uses — so a redispatch racing this can't have
@@ -819,16 +821,18 @@ async fn release_stepd_tracking(
             false
         }
     };
+    drop(sessions);
 
-    if removed_runtime || removed_tracked {
-        if let Err(error) = crate::stepd::record_resources_released(descriptor) {
-            warn!(
-                job_id = descriptor.job_id,
-                run_attempt = descriptor.run_attempt,
-                %error,
-                "failed to record runtime resource release after {reason}"
-            );
-        }
+    // Recorded even when a sibling keeps the job alive: this step's session is
+    // pruned only once its own release is durable.
+    if let Err(error) = crate::stepd::record_resources_released(descriptor) {
+        warn!(
+            job_id = descriptor.job_id,
+            run_attempt = descriptor.run_attempt,
+            step_id = descriptor.step_id,
+            %error,
+            "failed to record runtime resource release after {reason}"
+        );
     }
     removed_runtime || removed_tracked
 }
@@ -7594,6 +7598,62 @@ mod tests {
             allocation.lock().await.allocated_memory_mb,
             0,
             "the last step out releases the allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_attempts_session_does_not_strand_the_allocation() {
+        let current = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        let superseded = crate::stepd::StepdDescriptor::new(
+            42,
+            6,
+            9,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42, 1));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        for descriptor in [&current, &superseded] {
+            sessions
+                .lock()
+                .await
+                .insert(stepd_key(descriptor), descriptor.clone());
+        }
+
+        release_stepd_tracking(&running, &allocation, &sessions, &current, "step exit").await;
+
+        assert_eq!(
+            allocation.lock().await.allocated_memory_mb,
+            0,
+            "a session left by an older attempt has no claim on this one"
         );
     }
 
