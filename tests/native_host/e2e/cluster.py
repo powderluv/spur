@@ -23,7 +23,7 @@ import tomli_w
 
 logger = logging.getLogger(__name__)
 
-BINARIES = ["spurctld", "spurd", "spur"]
+BINARIES = ["spurctld", "spurd", "spur", "spurstepd"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 

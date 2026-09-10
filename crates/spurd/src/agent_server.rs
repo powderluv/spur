@@ -343,6 +343,14 @@ fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDe
         .collect()
 }
 
+/// Whether a supervisor holds the job's own processes. An allocation's extern
+/// step only tracks its lifetime — its steps still run under the agent.
+fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
+    descriptors
+        .iter()
+        .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
+}
+
 async fn fence_displaced_stepd(
     stepds: &Arc<Mutex<StepdMap>>,
     job_id: u32,
@@ -1012,7 +1020,9 @@ pub(crate) fn monitor_recovered_stepds(
                     completion.signal,
                     completion.run_attempt,
                     &hostname,
-                    None,
+                    completion.epilog_failed.then_some(&DrainRequest {
+                        reason: "epilog script failed".into(),
+                    }),
                 )
                 .await
                 {
@@ -2380,11 +2390,7 @@ impl AgentService {
     }
 
     async fn is_stepd_backed(&self, job_id: u32) -> bool {
-        self.stepds
-            .lock()
-            .await
-            .keys()
-            .any(|(tracked, _)| *tracked == job_id)
+        owns_job_processes(&stepds_for_job(&*self.stepds.lock().await, job_id))
     }
 
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
@@ -5946,7 +5952,7 @@ impl AgentService {
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_job(&*self.stepds.lock().await, job_id);
-        let supervised = !runtimes.is_empty();
+        let supervised = owns_job_processes(&runtimes);
         for descriptor in runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 &descriptor,
@@ -6058,7 +6064,7 @@ impl AgentService {
 
     async fn graceful_cancel(&self, job_id: u32) {
         let runtimes = stepds_for_job(&*self.stepds.lock().await, job_id);
-        let supervised = !runtimes.is_empty();
+        let supervised = owns_job_processes(&runtimes);
         for descriptor in runtimes {
             match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
                 .await
@@ -7608,6 +7614,33 @@ mod tests {
     fn an_interactive_allocation_is_recorded_as_the_extern_step() {
         assert_eq!(launch_step_id(true), spur_core::step::STEP_EXTERN);
         assert_eq!(launch_step_id(false), spur_core::step::STEP_BATCH);
+    }
+
+    // An allocation's extern step tracks its lifetime; its steps still run under
+    // the agent, so cancel and exec must not treat it as owning them.
+    #[test]
+    fn an_allocation_supervisor_does_not_own_the_jobs_processes() {
+        let descriptor = |step_id| {
+            crate::stepd::StepdDescriptor::new(
+                42,
+                1,
+                step_id,
+                0,
+                0,
+                std::path::PathBuf::from("/tmp/runtime.sock"),
+                std::path::PathBuf::new(),
+            )
+        };
+        assert!(!owns_job_processes(&[descriptor(
+            spur_core::step::STEP_EXTERN
+        )]));
+        assert!(owns_job_processes(&[descriptor(
+            spur_core::step::STEP_BATCH
+        )]));
+        assert!(owns_job_processes(&[
+            descriptor(spur_core::step::STEP_EXTERN),
+            descriptor(7),
+        ]));
     }
 
     #[tokio::test]

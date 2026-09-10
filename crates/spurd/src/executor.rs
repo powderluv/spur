@@ -1909,9 +1909,10 @@ async fn launch_container_job(
     .ok();
     let ready_r = pipe_r.as_raw_fd();
     let ready_w = pipe_w.as_raw_fd();
-    // Keep OwnedFd alive so the fds aren't closed prematurely
-    let _pipe_r_owner = pipe_r;
-    let _pipe_w_owner = pipe_w;
+    // Owners close these; the raw copies are only for the forked child, which
+    // execs or _exits without running destructors.
+    let pipe_r_owner = pipe_r;
+    let pipe_w_owner = pipe_w;
 
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
@@ -2034,8 +2035,8 @@ async fn launch_container_job(
         }
 
         nix::unistd::ForkResult::Parent { child } => {
+            drop(pipe_w_owner);
             unsafe {
-                libc::close(ready_w);
                 if cgroup_log_fd >= 0 {
                     libc::close(cgroup_log_fd);
                 }
@@ -2055,9 +2056,7 @@ async fn launch_container_job(
             let mut buf = [0u8; 512];
             let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
             let n = n.max(0) as usize;
-            unsafe {
-                libc::close(ready_r);
-            }
+            drop(pipe_r_owner);
 
             if n < 2 || &buf[..2] != b"OK" {
                 let msg = String::from_utf8_lossy(&buf[..n]);
