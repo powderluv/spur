@@ -219,6 +219,8 @@ pub enum StepdResponse {
         active: bool,
         exit_code: Option<i32>,
         signal: Option<i32>,
+        /// The workload's own pid, which owns the job's namespaces.
+        job_pid: i32,
     },
     Acknowledged,
     Rejected {
@@ -258,6 +260,8 @@ pub struct StepdSnapshot {
     pub active: bool,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    /// The workload's own pid, which owns the job's namespaces.
+    pub job_pid: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +390,7 @@ impl Stepd {
         step_id: spur_core::step::StepId,
         environment: std::collections::HashMap<String, String>,
     ) -> Self {
+        let job_pid = job.pid().unwrap_or(0) as i32;
         Self {
             job: Mutex::new(job),
             cgroup_path: Mutex::new(None),
@@ -396,6 +401,7 @@ impl Stepd {
                 active: true,
                 exit_code: None,
                 signal: None,
+                job_pid,
             })),
             teardown_started: AtomicBool::new(false),
             launch_gate: Mutex::new(()),
@@ -508,6 +514,7 @@ impl StepdSnapshot {
             active: self.active,
             exit_code: self.exit_code,
             signal: self.signal,
+            job_pid: self.job_pid,
         }
     }
 }
@@ -533,10 +540,6 @@ pub struct StepdDescriptor {
     pub gid: u32,
     #[serde(default)]
     pub work_dir: String,
-    /// The job's own process, which owns its namespaces. The supervisor's own
-    /// pid is `pid`; this is what exec and attach must enter.
-    #[serde(default)]
-    pub job_pid: i32,
 }
 
 impl StepdDescriptor {
@@ -564,7 +567,6 @@ impl StepdDescriptor {
             uid: 0,
             gid: 0,
             work_dir: String::new(),
-            job_pid: 0,
         }
     }
 }
@@ -754,6 +756,7 @@ pub async fn query_state(
             active,
             exit_code,
             signal,
+            job_pid,
         } if job_id == descriptor.job_id
             && run_attempt == descriptor.run_attempt
             && step_id == descriptor.step_id =>
@@ -765,6 +768,7 @@ pub async fn query_state(
                 active,
                 exit_code,
                 signal,
+                job_pid,
             })
         }
         _ => Err(io::Error::new(
@@ -1142,13 +1146,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     };
-    descriptor.job_pid = job.pid().unwrap_or(0) as i32;
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
-    }
-    if launched_cgroup.is_some() || descriptor.job_pid != 0 {
         if let Err(error) = store.publish(&descriptor) {
-            tracing::warn!(job_id, %error, "failed to republish runtime descriptor");
+            tracing::warn!(job_id, %error, "failed to republish runtime descriptor with cgroup path");
         }
     }
     let session = Arc::new(Stepd::with_environment(

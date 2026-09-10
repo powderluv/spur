@@ -2432,13 +2432,21 @@ impl AgentService {
         self.stepds.clone()
     }
 
-    /// The job's own process as reported by its supervisor. Taken before any
-    /// `running` lock so the stepds -> running order is preserved.
+    /// The job's own process, asked of its supervisor over the control socket —
+    /// live state, so it is not kept in the durable descriptor.
     async fn supervised_job_pid(&self, job_id: u32) -> Option<i32> {
-        stepds_for_job(&*self.stepds.lock().await, job_id)
-            .into_iter()
-            .map(|descriptor| descriptor.job_pid)
-            .find(|pid| *pid != 0)
+        let descriptors = stepds_for_job(&*self.stepds.lock().await, job_id);
+        for descriptor in descriptors {
+            let state =
+                crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await;
+            match state {
+                Ok(snapshot) if snapshot.job_pid != 0 => return Some(snapshot.job_pid),
+                Ok(_) => {}
+                Err(error) => warn!(job_id, step_id = descriptor.step_id, %error,
+                    "could not read the supervised job's pid"),
+            }
+        }
+        None
     }
 
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
