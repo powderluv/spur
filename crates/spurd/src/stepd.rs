@@ -196,6 +196,9 @@ pub enum StepdRequest {
         step_id: spur_core::step::StepId,
     },
     QueryState,
+    /// Releases the job for execution. spurd sends it once its own launch
+    /// bookkeeping is done, so the workload cannot outrun the agent.
+    Start,
     SignalAllocation {
         signal: i32,
     },
@@ -221,6 +224,10 @@ pub enum StepdResponse {
         signal: Option<i32>,
         /// The workload's own pid, which owns the job's namespaces.
         job_pid: i32,
+        /// Empty when the launch degraded to no isolation, or when talking to
+        /// a supervisor from before this field existed.
+        #[serde(default)]
+        cgroup_path: String,
     },
     Acknowledged,
     Rejected {
@@ -262,6 +269,8 @@ pub struct StepdSnapshot {
     pub signal: Option<i32>,
     /// The workload's own pid, which owns the job's namespaces.
     pub job_pid: i32,
+    /// Empty when the launch degraded to no isolation.
+    pub cgroup_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +359,9 @@ where
 pub const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
 const STEPD_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the pre-launch wait so an agent that dies mid-launch cannot strand
+/// the supervisor holding the job's resources.
+const START_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // A Stepd supervises exactly one step's process tree; PTY/srun steps get
 // their own separate Stepd in follow-up work, not a slot in this one.
@@ -402,6 +414,7 @@ impl Stepd {
                 exit_code: None,
                 signal: None,
                 job_pid,
+                cgroup_path: String::new(),
             })),
             teardown_started: AtomicBool::new(false),
             launch_gate: Mutex::new(()),
@@ -415,6 +428,10 @@ impl Stepd {
 
     pub async fn adopt_cgroup(&self, cgroup_path: Option<PathBuf>) {
         *self.cgroup_path.lock().await = cgroup_path;
+    }
+
+    pub async fn cgroup(&self) -> Option<PathBuf> {
+        self.cgroup_path.lock().await.clone()
     }
 
     async fn take_cgroup(&self) -> Option<PathBuf> {
@@ -515,6 +532,7 @@ impl StepdSnapshot {
             exit_code: self.exit_code,
             signal: self.signal,
             job_pid: self.job_pid,
+            cgroup_path: String::new(),
         }
     }
 }
@@ -757,6 +775,7 @@ pub async fn query_state(
             exit_code,
             signal,
             job_pid,
+            cgroup_path,
         } if job_id == descriptor.job_id
             && run_attempt == descriptor.run_attempt
             && step_id == descriptor.step_id =>
@@ -769,11 +788,24 @@ pub async fn query_state(
                 exit_code,
                 signal,
                 job_pid,
+                cgroup_path,
             })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime state identity mismatch",
+        )),
+    }
+}
+
+/// Releases a supervisor's job for execution.
+pub async fn start_job(descriptor: &StepdDescriptor, spurd_instance_id: String) -> io::Result<()> {
+    match stepd_request(descriptor, spurd_instance_id, StepdRequest::Start).await? {
+        StepdResponse::Acknowledged => Ok(()),
+        StepdResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected response to start",
         )),
     }
 }
@@ -985,7 +1017,24 @@ pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()
             )
         })?;
         let response = match request {
-            StepdRequest::QueryState => session.snapshot().await.response(),
+            StepdRequest::QueryState => {
+                let mut response = session.snapshot().await.response();
+                if let StepdResponse::State {
+                    ref mut cgroup_path,
+                    ..
+                } = response
+                {
+                    *cgroup_path = session
+                        .cgroup()
+                        .await
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                }
+                response
+            }
+            // The job is already running by the time control is served, so a
+            // repeat Start (a retrying agent) is a no-op rather than an error.
+            StepdRequest::Start => StepdResponse::Acknowledged,
             StepdRequest::BeginTeardown | StepdRequest::Shutdown => {
                 session.begin_teardown().await;
                 StepdResponse::Acknowledged
@@ -1008,6 +1057,108 @@ pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()
         })?;
         reader.get_mut().write_all(&response).await?;
         reader.get_mut().write_all(b"\n").await?;
+    }
+}
+
+/// Serves the control socket before the job exists, so spurd's handshake
+/// completes without waiting on the launch. Returns once Start arrives.
+async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> io::Result<()> {
+    // Connections are served concurrently: the agent's readiness probe and its
+    // later Start arrive on separate connections, and the first must not block
+    // the second.
+    let (released, mut is_released) = tokio::sync::mpsc::channel::<()>(1);
+    loop {
+        tokio::select! {
+            _ = is_released.recv() => return Ok(()),
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let descriptor = descriptor.clone();
+                let released = released.clone();
+                tokio::spawn(async move {
+                    let hello = tokio::time::timeout(
+                        STEPD_HANDSHAKE_TIMEOUT,
+                        accept_hello_stream(stream, &descriptor, &descriptor.capability),
+                    )
+                    .await;
+                    let stream = match hello {
+                        Ok(Ok((stream, _))) => stream,
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "pre-launch handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!("pre-launch handshake timed out");
+                            return;
+                        }
+                    };
+                    match serve_until_start(stream, &descriptor).await {
+                        Ok(true) => {
+                            let _ = released.send(()).await;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "pre-launch control connection failed")
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Answers requests on one connection until Start. `Ok(true)` means the job
+/// was released; `Ok(false)` means the peer hung up without releasing it.
+async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> io::Result<bool> {
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            CONTROL_REQUEST_IDLE_TIMEOUT,
+            read_line_bounded(&mut reader, &mut line),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "control connection idle timeout")
+        })??;
+        if read == 0 {
+            return Ok(false);
+        }
+        let request: StepdRequest = serde_json::from_str(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid runtime request: {error}"),
+            )
+        })?;
+        let started = matches!(request, StepdRequest::Start);
+        let response = match request {
+            StepdRequest::Start => StepdResponse::Acknowledged,
+            // The agent probes readiness with QueryState before releasing the
+            // job, so refusing it here would deadlock the launch.
+            StepdRequest::QueryState => StepdResponse::State {
+                job_id: descriptor.job_id,
+                run_attempt: descriptor.run_attempt,
+                step_id: descriptor.step_id,
+                active: true,
+                exit_code: None,
+                signal: None,
+                job_pid: 0,
+                cgroup_path: String::new(),
+            },
+            _ => StepdResponse::Rejected {
+                message: "job has not been started yet".into(),
+            },
+        };
+        let encoded = serde_json::to_vec(&response).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("encode runtime response: {error}"),
+            )
+        })?;
+        reader.get_mut().write_all(&encoded).await?;
+        reader.get_mut().write_all(b"\n").await?;
+        if started {
+            return Ok(true);
+        }
     }
 }
 
@@ -1129,6 +1280,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
+    // Hold the workload until spurd has finished its own launch bookkeeping,
+    // so an srun on the script's first line cannot outrun the job's start.
+    tokio::time::timeout(START_GATE_TIMEOUT, await_start(&listener, &descriptor))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))??;
     let (job, launched_cgroup) = if launch_spec.allocation_only {
         (RunningJob::AllocationOnly, None)
     } else {
@@ -2608,5 +2764,80 @@ mod tests {
         assert_eq!(response, Some(AgentNotificationResponse::Acknowledged));
         let AgentNotification::StepdCompleted { job_id, .. } = agent.await.expect("agent task");
         assert_eq!(job_id, 7);
+    }
+
+    fn gate_descriptor() -> StepdDescriptor {
+        StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            PathBuf::from("/tmp/gate.sock"),
+            PathBuf::new(),
+        )
+    }
+
+    async fn send(writer: &mut (impl tokio::io::AsyncWriteExt + Unpin), request: StepdRequest) {
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&request).expect("encode")).as_bytes())
+            .await
+            .expect("write request");
+    }
+
+    #[tokio::test]
+    async fn the_gate_releases_the_job_on_start() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let descriptor = gate_descriptor();
+        let server =
+            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let (reader, mut writer) = client_stream.into_split();
+        send(&mut writer, StepdRequest::Start).await;
+        let mut line = String::new();
+        BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .expect("read ack");
+        assert!(matches!(
+            serde_json::from_str::<StepdResponse>(&line).expect("decode"),
+            StepdResponse::Acknowledged
+        ));
+        assert!(server.await.expect("join").expect("serve"));
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_work_until_the_job_is_released() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let descriptor = gate_descriptor();
+        let server =
+            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let (reader, mut writer) = client_stream.into_split();
+        send(&mut writer, StepdRequest::SignalAllocation { signal: 15 }).await;
+        send(&mut writer, StepdRequest::Start).await;
+        let mut reader = BufReader::new(reader);
+        let mut refused = String::new();
+        reader.read_line(&mut refused).await.expect("read refusal");
+        assert!(matches!(
+            serde_json::from_str::<StepdResponse>(&refused).expect("decode"),
+            StepdResponse::Rejected { .. }
+        ));
+        let mut ack = String::new();
+        reader.read_line(&mut ack).await.expect("read ack");
+        assert!(matches!(
+            serde_json::from_str::<StepdResponse>(&ack).expect("decode"),
+            StepdResponse::Acknowledged
+        ));
+        assert!(server.await.expect("join").expect("serve"));
+    }
+
+    // An agent that dies mid-launch must not leave the job released.
+    #[tokio::test]
+    async fn the_gate_reports_a_peer_that_hung_up_without_starting() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let descriptor = gate_descriptor();
+        let server =
+            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        drop(client_stream);
+        assert!(!server.await.expect("join").expect("serve"));
     }
 }

@@ -262,10 +262,6 @@ async fn launch_stepd(
         Err(error) => warn!(job_id = config.job_id, run_attempt, %error,
             "failed to reload runtime descriptor; liveness checks will skip this session"),
     }
-    // Steps, exec and attach join the job's cgroup through the tracked job, so
-    // report the one the supervisor created rather than leaving them outside it.
-    let cgroup_path =
-        Some(descriptor.cgroup_path.clone()).filter(|path| !path.as_os_str().is_empty());
     // scontrol reports these back, so resolve the patterns the same way the
     // unsupervised launch does rather than echoing the raw request.
     let work_dir = descriptor.work_dir.clone();
@@ -275,7 +271,8 @@ async fn launch_stepd(
             stdout_path: executor::resolve_output_path(config, &work_dir, &config.stdout_path),
             stderr_path: executor::resolve_output_path(config, &work_dir, &config.stderr_path),
             pty_master: None,
-            cgroup_path,
+            // Not created until the job is released; steps read it live.
+            cgroup_path: None,
         },
         descriptor,
     ))
@@ -2434,16 +2431,16 @@ impl AgentService {
 
     /// The job's own process, asked of its supervisor over the control socket —
     /// live state, so it is not kept in the durable descriptor.
-    async fn supervised_job_pid(&self, job_id: u32) -> Option<i32> {
+    async fn supervised_state(&self, job_id: u32) -> Option<crate::stepd::StepdSnapshot> {
         let descriptors = stepds_for_job(&*self.stepds.lock().await, job_id);
         for descriptor in descriptors {
             let state =
                 crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await;
             match state {
-                Ok(snapshot) if snapshot.job_pid != 0 => return Some(snapshot.job_pid),
+                Ok(snapshot) if snapshot.job_pid != 0 => return Some(snapshot),
                 Ok(_) => {}
                 Err(error) => warn!(job_id, step_id = descriptor.step_id, %error,
-                    "could not read the supervised job's pid"),
+                    "could not read the supervised job's state"),
             }
         }
         None
@@ -3996,6 +3993,16 @@ impl SlurmAgent for AgentService {
                     },
                 );
                 drop(jobs);
+                // Released only now: the workload must not start before this
+                // node's own bookkeeping is complete, or a step launched from
+                // the script can outrun the job's start.
+                if let Some(descriptor) = runtime_descriptor.as_ref() {
+                    if let Err(error) =
+                        crate::stepd::start_job(descriptor, uuid::Uuid::new_v4().to_string()).await
+                    {
+                        warn!(job_id, run_attempt, %error, "failed to release the supervised job");
+                    }
+                }
                 // Already claimed into `stepds` above, before the
                 // allocation/running commit; completion arrives by push
                 // notification, not by polling.
@@ -4622,7 +4629,14 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let supervised_pid = self.supervised_job_pid(job_id).await;
+        let supervised = self.supervised_state(job_id).await;
+        let supervised_pid = supervised.as_ref().map(|state| state.job_pid);
+        // The supervisor creates the cgroup after spurd's launch returns, so it
+        // is read live rather than from the descriptor written before the exec.
+        let supervised_cgroup = supervised
+            .as_ref()
+            .map(|state| std::path::PathBuf::from(&state.cgroup_path))
+            .filter(|path| !path.as_os_str().is_empty());
         let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -4651,7 +4665,10 @@ impl SlurmAgent for AgentService {
                 uid: tracked.uid,
                 gid: tracked.gid,
                 work_dir: tracked.work_dir.clone(),
-                cgroup_path: tracked.cgroup_path.clone(),
+                cgroup_path: tracked
+                    .cgroup_path
+                    .clone()
+                    .or_else(|| supervised_cgroup.clone()),
             };
             (
                 tracked.gpu_devices.clone(),
@@ -6290,7 +6307,14 @@ impl AgentService {
     /// node has confirmed LaunchJob (confirm_dispatch_on_nodes) — so no retry
     /// on a miss. Restart mid-job (empty `running`) is the one uncovered case.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
-        let supervised_pid = self.supervised_job_pid(job_id).await;
+        let supervised = self.supervised_state(job_id).await;
+        let supervised_pid = supervised.as_ref().map(|state| state.job_pid);
+        // The supervisor creates the cgroup after spurd's launch returns, so it
+        // is read live rather than from the descriptor written before the exec.
+        let supervised_cgroup = supervised
+            .as_ref()
+            .map(|state| std::path::PathBuf::from(&state.cgroup_path))
+            .filter(|path| !path.as_os_str().is_empty());
         let jobs = self.running.lock().await;
         let tracked = jobs
             .get(&job_id)
@@ -6313,7 +6337,10 @@ impl AgentService {
             uid: tracked.uid,
             gid: tracked.gid,
             work_dir: tracked.work_dir.clone(),
-            cgroup_path: tracked.cgroup_path.clone(),
+            cgroup_path: tracked
+                .cgroup_path
+                .clone()
+                .or_else(|| supervised_cgroup.clone()),
         })
     }
 
