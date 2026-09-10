@@ -262,13 +262,17 @@ async fn launch_stepd(
         Err(error) => warn!(job_id = config.job_id, run_attempt, %error,
             "failed to reload runtime descriptor; liveness checks will skip this session"),
     }
+    // Steps, exec and attach join the job's cgroup through the tracked job, so
+    // report the one the supervisor created rather than leaving them outside it.
+    let cgroup_path =
+        Some(descriptor.cgroup_path.clone()).filter(|path| !path.as_os_str().is_empty());
     Ok((
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
             stdout_path: config.stdout_path.clone(),
             stderr_path: config.stderr_path.clone(),
             pty_master: None,
-            cgroup_path: None,
+            cgroup_path,
         },
         descriptor,
     ))
@@ -327,6 +331,42 @@ fn launch_step_id(pty: bool) -> spur_core::step::StepId {
     } else {
         spur_core::step::STEP_BATCH
     }
+}
+
+/// Read a cgroup's member pids.
+fn cgroup_member_pids(cgroup_path: &std::path::Path) -> Vec<i32> {
+    std::fs::read_to_string(cgroup_path.join("cgroup.procs"))
+        .map(|procs| {
+            procs
+                .split_whitespace()
+                .filter_map(|pid| pid.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The process that owns a supervised job's namespaces: the one in the job's
+/// cgroup whose parent is outside it, since the supervisor never joins.
+fn cgroup_root_pid(cgroup_path: &std::path::Path) -> Option<i32> {
+    let members = cgroup_member_pids(cgroup_path);
+    let inside: std::collections::HashSet<i32> = members.iter().copied().collect();
+    members
+        .iter()
+        .find(|pid| parent_pid(**pid).is_some_and(|parent| !inside.contains(&parent)))
+        .copied()
+        .or_else(|| members.iter().copied().min())
+}
+
+/// A process's parent, read from the stat field after the (possibly
+/// space-containing) comm, which is why this splits on the closing paren.
+fn parent_pid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn stepd_key(descriptor: &crate::stepd::StepdDescriptor) -> StepdKey {
@@ -2389,10 +2429,6 @@ impl AgentService {
         self.stepds.clone()
     }
 
-    async fn is_stepd_backed(&self, job_id: u32) -> bool {
-        owns_job_processes(&stepds_for_job(&*self.stepds.lock().await, job_id))
-    }
-
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
         StepdRecoveryCleanup {
             running: self.running.clone(),
@@ -3304,21 +3340,13 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // Every job is supervised except direct-launch PMIx and pty launches,
-        // which keep the legacy path until the supervisor handles them.
+        // Opt-in until steps, exec and attach are served by the supervisor.
+        // Direct-launch PMIx and pty launches stay on the legacy path either way.
         let is_direct_pmix_batch =
             spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
-        let unsupervised_launch = is_direct_pmix_batch || spec.pty;
-        let stepd_enabled = !unsupervised_launch;
+        let stepd_enabled = !is_direct_pmix_batch && !spec.pty;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
-        if unsupervised_launch {
-            warn!(
-                job_id,
-                pty = spec.pty,
-                "job runs unsupervised; it will not survive an agent restart"
-            );
-        }
 
         // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
         // refuse root execution here — before anything is spawned — rather than relying on the
@@ -4186,14 +4214,6 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        // Logical steps inside a Stepd land in a follow-up PR; a
-        // runtime-backed job has no directly-tracked pid for the nsenter path below.
-        if self.is_stepd_backed(req.job_id).await {
-            return Err(Status::unimplemented(
-                "exec is not yet supported for a stepd-backed job",
-            ));
-        }
-
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
         let plan = build_launch_plan(&entry, priv_drop.as_ref(), &req.command);
@@ -4594,9 +4614,18 @@ impl SlurmAgent for AgentService {
             } else {
                 tracked.nodelist.clone()
             };
-            let pid = tracked.job.pid().unwrap_or(0);
+            // A supervised job is tracked without a pid of its own; its namespaces
+            // belong to the process at the root of the job's cgroup.
+            let pid = match tracked.job.pid() {
+                Some(pid) => pid as i32,
+                None => tracked
+                    .cgroup_path
+                    .as_deref()
+                    .and_then(cgroup_root_pid)
+                    .unwrap_or(0),
+            };
             let entry = crate::job_entry::JobEntry {
-                pid: pid as i32,
+                pid,
                 has_pid_namespace: tracked.has_pid_namespace,
                 has_user_namespace: tracked.has_user_namespace,
                 has_mount_namespace: tracked.has_mount_namespace,
@@ -5426,14 +5455,6 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        // Interactive PTY sessions inside a Stepd land in a follow-up
-        // PR; a runtime-backed job has no directly-tracked pid to attach to below.
-        if self.is_stepd_backed(init.job_id).await {
-            return Err(Status::unimplemented(
-                "interactive attach is not yet supported for a stepd-backed job",
-            ));
-        }
-
         // Dispatch mirrors run_command's three cases. A parent job with live
         // namespaces (containerized sbatch/salloc) is entered via nsenter; a step
         // that requested its own image with no such parent builds a fresh
@@ -6235,10 +6256,19 @@ impl AgentService {
             .get(&job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
 
-        let pid = tracked.job.pid().unwrap_or(0);
+        // A supervised job is tracked without a pid of its own; its namespaces
+        // belong to the process at the root of the job's cgroup.
+        let pid = match tracked.job.pid() {
+            Some(pid) => pid as i32,
+            None => tracked
+                .cgroup_path
+                .as_deref()
+                .and_then(cgroup_root_pid)
+                .unwrap_or(0),
+        };
 
         Ok(crate::job_entry::JobEntry {
-            pid: pid as i32,
+            pid,
             has_pid_namespace: tracked.has_pid_namespace,
             has_user_namespace: tracked.has_user_namespace,
             has_mount_namespace: tracked.has_mount_namespace,
@@ -7618,8 +7648,27 @@ mod tests {
         assert_eq!(launch_step_id(false), spur_core::step::STEP_BATCH);
     }
 
-    // An allocation's extern step tracks its lifetime; its steps still run under
-    // the agent, so cancel and exec must not treat it as owning them.
+    // A supervised job has no tracked pid, so exec and attach enter through the
+    // process at the root of its cgroup rather than being refused.
+    #[test]
+    fn the_cgroup_root_pid_is_the_member_whose_parent_is_outside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // This process's parent is outside the set; the other member sits above
+        // pid_max, so its parentage cannot be read and it is not the root.
+        let me = std::process::id() as i32;
+        std::fs::write(dir.path().join("cgroup.procs"), format!("9999999\n{me}\n"))
+            .expect("write procs");
+        assert_eq!(cgroup_root_pid(dir.path()), Some(me));
+    }
+
+    #[test]
+    fn a_cgroup_with_no_members_yields_no_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cgroup.procs"), b"").expect("write procs");
+        assert_eq!(cgroup_root_pid(dir.path()), None);
+        assert_eq!(cgroup_root_pid(std::path::Path::new("/nonexistent")), None);
+    }
+
     #[test]
     fn an_allocation_supervisor_does_not_own_the_jobs_processes() {
         let descriptor = |step_id| {
