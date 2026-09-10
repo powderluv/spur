@@ -319,6 +319,16 @@ fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
 pub(crate) type StepdKey = (u32, spur_core::step::StepId);
 pub(crate) type StepdMap = HashMap<StepdKey, crate::stepd::StepdDescriptor>;
 
+/// An interactive allocation owns the job's extern step, not its batch script.
+/// Fencing and the tracked-attempt check must agree with what launch records.
+fn launch_step_id(pty: bool) -> spur_core::step::StepId {
+    if pty {
+        spur_core::step::STEP_EXTERN
+    } else {
+        spur_core::step::STEP_BATCH
+    }
+}
+
 fn stepd_key(descriptor: &crate::stepd::StepdDescriptor) -> StepdKey {
     (descriptor.job_id, descriptor.step_id)
 }
@@ -3326,14 +3336,12 @@ impl SlurmAgent for AgentService {
             "received job launch request"
         );
 
+        let launch_step = launch_step_id(spec.pty);
+
         if stepd_enabled {
-            let already_tracked = runtime_attempt_already_tracked(
-                &self.stepds,
-                job_id,
-                spur_core::step::STEP_BATCH,
-                run_attempt,
-            )
-            .await;
+            let already_tracked =
+                runtime_attempt_already_tracked(&self.stepds, job_id, launch_step, run_attempt)
+                    .await;
             if already_tracked {
                 // Idempotent retry: this exact attempt is already tracked and
                 // alive on this node (e.g. spurctld retried after losing the
@@ -3761,18 +3769,13 @@ impl SlurmAgent for AgentService {
         };
 
         let launch_result = if stepd_enabled {
-            fence_displaced_stepd(
-                &self.stepds,
-                job_id,
-                spur_core::step::STEP_BATCH,
-                run_attempt,
-            )
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "failed to fence displaced stepd before launch: {error}"
-                ))
-            })?;
+            fence_displaced_stepd(&self.stepds, job_id, launch_step, run_attempt)
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!(
+                        "failed to fence displaced stepd before launch: {error}"
+                    ))
+                })?;
             launch_stepd(
                 &launch_cfg,
                 run_attempt,
@@ -3780,7 +3783,7 @@ impl SlurmAgent for AgentService {
                 &self.reporter.hostname,
                 &self.stepd_state_dir,
                 StepdLaunchOptions {
-                    step_id: spur_core::step::STEP_BATCH,
+                    step_id: launch_step,
                     allocation_only: false,
                     container_rootfs_mode: launch_cfg
                         .container
@@ -7599,6 +7602,12 @@ mod tests {
             0,
             "the last step out releases the allocation"
         );
+    }
+
+    #[test]
+    fn an_interactive_allocation_is_recorded_as_the_extern_step() {
+        assert_eq!(launch_step_id(true), spur_core::step::STEP_EXTERN);
+        assert_eq!(launch_step_id(false), spur_core::step::STEP_BATCH);
     }
 
     #[tokio::test]
