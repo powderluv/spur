@@ -70,7 +70,7 @@ impl ClusterRole {
     }
 
     /// Parse the controller-supplied role string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_role(s: &str) -> Option<Self> {
         match s {
             "controller" => Some(ClusterRole::Controller),
             "worker" => Some(ClusterRole::Worker),

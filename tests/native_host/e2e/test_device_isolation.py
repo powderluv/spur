@@ -366,7 +366,7 @@ class TestStepAndExecDeviceIsolation:
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "dev-iso-step-cgroup", [])
-        procs = f"/sys/fs/cgroup/spur/job_{job_id}/cgroup.procs"
+        procs = f"/sys/fs/cgroup/spur/job_{job_id}_1/cgroup.procs"
         probe = cluster.write_file(
             "dev-iso-step-cgroup-probe.sh",
             f"""#!/bin/bash
@@ -461,7 +461,7 @@ class TestDeviceFilterLifecycle:
         assert baseline >= 0, "could not read the loaded cgroup_device program count"
 
         probe = _run_probe(cluster, "dev-iso-life", "true\n", ["--gres=gpu:1"])
-        cgroup = f"/sys/fs/cgroup/spur/job_{probe.job_id}"
+        cgroup = f"/sys/fs/cgroup/spur/job_{probe.job_id}_1"
 
         # Scoped to this job's cgroup rather than every job_* directory, so a
         # job belonging to another test cannot decide this one.

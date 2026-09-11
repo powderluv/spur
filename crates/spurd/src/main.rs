@@ -1,21 +1,6 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-mod agent_server;
-mod auth_middleware;
-mod cluster;
-pub mod container;
-mod device_cgroup;
-mod executor;
-pub(crate) mod job_entry;
-pub(crate) mod job_lifecycle;
-mod landlock;
-mod mpi_plugin;
-pub(crate) mod privdrop;
-pub(crate) mod pty;
-mod reporter;
-mod seccomp;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,7 +13,8 @@ use spur_core::config::{ConfigError, SlurmConfig};
 use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
-use reporter::NodeReporter;
+use spurd::reporter::NodeReporter;
+use spurd::{agent_server, auth_middleware, executor, reporter, stepd};
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
@@ -192,6 +178,51 @@ struct Args {
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Directory for this agent's own persisted runtime state (stepd sessions).
+    /// Defaults to the controller's configured state_dir, then /var/spool/spur.
+    #[arg(long, env = "SPUR_STEPD_STATE_DIR")]
+    state_dir: Option<String>,
+}
+
+/// Identity of a session whose descriptor failed to parse. The directory is
+/// named `<job>.<attempt>.<step>`, so it still names the session.
+fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32, spur_core::step::StepId)> {
+    let mut parts = path.file_name()?.to_str()?.split('.');
+    let job_id = parts.next()?.parse().ok()?;
+    let run_attempt = parts.next()?.parse().ok()?;
+    let step_id = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((job_id, run_attempt, step_id))
+}
+
+/// The cgroup to reap for a stale session. A descriptor written before its
+/// cgroup was recorded still names the job, and the path follows from identity.
+fn stale_cgroup_path(descriptor: &stepd::StepdDescriptor) -> std::path::PathBuf {
+    if descriptor.cgroup_path.as_os_str().is_empty() {
+        executor::expected_cgroup_path(descriptor.job_id, descriptor.run_attempt)
+    } else {
+        descriptor.cgroup_path.clone()
+    }
+}
+
+/// True when retrying a runtime-recovery report can never help: the
+/// controller has no jwt_key configured, or this node's own identity/token
+/// is invalid — none of which a retry loop can fix on its own.
+fn is_permanent_recovery_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<tonic::Status>())
+        .any(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::FailedPrecondition
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::PermissionDenied
+            )
+        })
 }
 
 #[tokio::main]
@@ -262,6 +293,50 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
+
+    let stepd_state_dir = args.state_dir.clone().unwrap_or_else(|| {
+        config
+            .as_ref()
+            .map(|c| c.controller.state_dir.clone())
+            .unwrap_or_else(|| "/var/spool/spur".into())
+    });
+    let stepds = stepd::StepdStore::new(&stepd_state_dir);
+    let discovered_sessions = stepds.discover_live()?;
+    // A corrupted descriptor still names its (job_id, run_attempt) in the
+    // directory it lives in — fence it the same way as a stale session
+    // instead of silently forgetting the job forever.
+    let mut unparseable_rejected = Vec::new();
+    let mut corrupted_stepds = Vec::new();
+    for (path, reason) in discovered_sessions.rejected {
+        match parse_session_dir_name(&path) {
+            Some(identity) => corrupted_stepds.push(identity),
+            None => unparseable_rejected.push((path, reason)),
+        }
+    }
+    for (path, reason) in unparseable_rejected {
+        warn!(path = %path.display(), %reason, "ignoring unusable stepd descriptor");
+    }
+    let recovered_stepds = discovered_sessions.live;
+    let stale_stepds = discovered_sessions.stale;
+    // A stale session's supervisor is confirmed dead, but that alone doesn't
+    // kill its cgroup: if only the supervisor was killed (not the whole
+    // process tree), the job's own process survives as an unsupervised
+    // orphan. Reap it locally instead of leaving it running indefinitely.
+    for descriptor in &stale_stepds {
+        executor::cleanup_cgroup(&stale_cgroup_path(descriptor));
+    }
+    // A corrupted descriptor has no cgroup_path to read, but the path is
+    // reconstructable from identity alone — reap it the same way.
+    for &(job_id, run_attempt, _) in &corrupted_stepds {
+        executor::cleanup_cgroup(&executor::expected_cgroup_path(job_id, run_attempt));
+    }
+    if !recovered_stepds.is_empty() {
+        warn!(
+            sessions = recovered_stepds.len(),
+            root = %stepds.root().display(),
+            "reporting PID-fenced stepds before asynchronous reconnect"
+        );
+    }
 
     // WireGuard interface for mesh address/key/peers. Resolution: SPUR_WG_INTERFACE env >
     // [network] wg_interface in spur.conf > "spur0", so a non-default conf name is honored.
@@ -376,6 +451,7 @@ async fn main() -> anyhow::Result<()> {
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.
     let running_jobs = agent_server::new_running_jobs();
+    agent_server::recover_stepds(&running_jobs, recovered_stepds.clone()).await;
 
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
@@ -392,11 +468,37 @@ async fn main() -> anyhow::Result<()> {
     // Register with controller
     reporter.register().await?;
 
-    // Start heartbeat loop
+    // Start the heartbeat loop right after registration, before the
+    // completion-replay step below: replaying unacknowledged completions
+    // retries against the controller (bounded, but can add several seconds
+    // per pending completion) and must never delay heartbeats from resuming
+    // after a restart — a slow replay must not look like a dead node.
     let hb_reporter = reporter.clone();
     tokio::spawn(async move {
         hb_reporter.heartbeat_loop().await;
     });
+
+    let unacknowledged_stepd_completions: std::collections::HashSet<_> = stepds
+        .discover_unacknowledged_completions()?
+        .into_iter()
+        .map(|completion| (completion.job_id, completion.run_attempt))
+        .collect();
+    let reconciled_stepd_completions =
+        agent_server::replay_unacknowledged_stepd_completions(&stepds, &args.controller, &hostname)
+            .await?;
+    let reconciled_stepd_completions: std::collections::HashSet<_> =
+        reconciled_stepd_completions.into_iter().collect();
+    // Runs for the daemon's life, not just when this scan found something —
+    // a push notification deferred later needs the same reconciliation.
+    agent_server::retry_unacknowledged_stepd_completions(
+        stepds.clone(),
+        args.controller.clone(),
+        hostname.clone(),
+    );
+    let pruned_stepds = stepds.prune_finalized()?;
+    if pruned_stepds > 0 {
+        info!(sessions = pruned_stepds, "pruned finalized stepd state");
+    }
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
@@ -448,7 +550,26 @@ async fn main() -> anyhow::Result<()> {
         mpi_config,
         running_jobs,
         allow_root_jobs,
-    );
+    )
+    .with_runtime_state_dir(stepd_state_dir.clone());
+    agent_service.adopt_stepds(&recovered_stepds).await;
+    // stepd_state_dir is shared with spurctld's own state_dir when the operator
+    // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
+    // exclusively spurd's — use the runtime/ subdir spurd already owns.
+    stepd::create_private_dir_all(stepds.root())?;
+    let agent_notify_socket = stepds.agent_socket();
+    if agent_notify_socket.exists() {
+        std::fs::remove_file(&agent_notify_socket)?;
+    }
+    let agent_notify_listener = tokio::net::UnixListener::bind(&agent_notify_socket)?;
+    tokio::spawn(agent_server::serve_completion_notifications(
+        agent_notify_listener,
+        agent_service.completion_listener_context(),
+    ));
+    agent_service.monitor_recovered_stepds(&recovered_stepds);
+    agent_service.monitor_stepd_liveness();
+    let stepd_recovery_cleanup = agent_service.stepd_recovery_cleanup();
+    let stepds_handle = agent_service.stepds_handle();
 
     // the RPC-driven k0s component owner is idle until the controller sends
     // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —
@@ -475,13 +596,15 @@ async fn main() -> anyhow::Result<()> {
     let auth_mode = config.as_ref().map(|c| c.auth.mode).unwrap_or_default();
     let jwt_key = config
         .as_ref()
-        .and_then(|c| c.auth.jwt_key.clone())
+        .map(|c| c.auth.resolved_jwt_key())
+        .transpose()?
+        .flatten()
         .unwrap_or_default();
     match auth_mode {
         spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
             anyhow::bail!(
-                "[auth] mode = \"required\" but no jwt_key is configured on this node: the agent \
-                 could never verify a credential and would refuse every launch"
+                "[auth] mode = \"required\" but no jwt_key or jwt_key_file is configured on this \
+                 node: the agent could never verify a credential and would refuse every launch"
             )
         }
         spur_core::config::AuthMode::Required => {
@@ -499,17 +622,148 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server_future = tonic::transport::Server::builder()
-        .layer(crate::auth_middleware::AgentAuthLayer::new(
-            auth_mode, &jwt_key,
-        ))
+        .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
+    let server_task = tokio::spawn(server_future);
+
+    if !recovered_stepds.is_empty() {
+        for descriptor in recovered_stepds {
+            let recovery_reporter = reporter.clone();
+            let recovery_cleanup = stepd_recovery_cleanup.clone();
+            tokio::spawn(async move {
+                loop {
+                    match recovery_reporter
+                        .report_stepd_recovery(
+                            descriptor.job_id,
+                            descriptor.run_attempt,
+                            descriptor.step_id,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(response) => {
+                            if response.fenced {
+                                warn!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    message = %response.message,
+                                    "controller fenced recovered stepd"
+                                );
+                                recovery_cleanup.reject(&descriptor).await;
+                            } else if response.retained {
+                                info!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    "controller retained recovered stepd"
+                                );
+                            } else {
+                                info!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    message = %response.message,
+                                    "controller ignored stale recovered stepd"
+                                );
+                                recovery_cleanup.reject(&descriptor).await;
+                            }
+                            if response.retained && !response.message.is_empty() {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) if is_permanent_recovery_error(&error) => {
+                            warn!(
+                                job_id = descriptor.job_id,
+                                run_attempt = descriptor.run_attempt,
+                                ?error,
+                                "runtime recovery report permanently rejected by the controller; \
+                                 giving up on this session"
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            warn!(
+                                job_id = descriptor.job_id,
+                                run_attempt = descriptor.run_attempt,
+                                %error,
+                                "runtime recovery report failed; retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    let unreportable_sessions = stale_stepds
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+        })
+        .chain(corrupted_stepds)
+        .filter(|(job_id, run_attempt, _)| {
+            let id = (*job_id, *run_attempt);
+            !reconciled_stepd_completions.contains(&id)
+                && !unacknowledged_stepd_completions.contains(&id)
+        });
+    for (job_id, run_attempt, step_id) in unreportable_sessions {
+        let recovery_reporter = reporter.clone();
+        tokio::spawn(async move {
+            loop {
+                match recovery_reporter
+                    .report_stepd_recovery(job_id, run_attempt, step_id, true)
+                    .await
+                {
+                    Ok(response) => {
+                        if response.fenced {
+                            warn!(
+                                job_id,
+                                run_attempt,
+                                message = %response.message,
+                                "controller fenced stale stepd"
+                            );
+                        }
+                        break;
+                    }
+                    Err(error) if is_permanent_recovery_error(&error) => {
+                        warn!(
+                            job_id,
+                            run_attempt,
+                            ?error,
+                            "stale runtime recovery report permanently rejected by the controller; \
+                             giving up on this session"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            job_id,
+                            run_attempt,
+                            %error,
+                            "stale runtime recovery report failed; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
+    }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
-        result = server_future => { result?; }
+        result = server_task => { result??; }
         _ = sigterm.recv() => {
+            if !stepds_handle.lock().await.is_empty() {
+                info!("received SIGTERM with held stepds; preserving controller registration");
+                return Ok(());
+            }
             info!("received SIGTERM, deregistering from controller");
             let dereg_reporter = reporter.clone();
             match tokio::time::timeout(
@@ -586,6 +840,50 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    #[test]
+    fn a_stale_session_without_a_recorded_cgroup_still_names_one_to_reap() {
+        let mut descriptor = stepd::StepdDescriptor::new(
+            7,
+            2,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/run/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert_eq!(
+            stale_cgroup_path(&descriptor),
+            executor::expected_cgroup_path(7, 2),
+            "an allocation session records no cgroup of its own, so its steps \
+             would otherwise never be reaped"
+        );
+
+        descriptor.cgroup_path = std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2");
+        assert_eq!(
+            stale_cgroup_path(&descriptor),
+            std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2")
+        );
+    }
+
+    #[test]
+    fn session_dir_name_reads_job_attempt_and_step() {
+        assert_eq!(
+            parse_session_dir_name(std::path::Path::new("/run/spur/runtime/42.1.4294967295")),
+            Some((42, 1, 4294967295))
+        );
+    }
+
+    #[test]
+    fn session_dir_name_rejects_names_that_are_not_a_session() {
+        for name in ["agent.sock", "42.1", "42.1.7.9", "42.one.7"] {
+            assert_eq!(
+                parse_session_dir_name(std::path::Path::new(name)),
+                None,
+                "{name} should not parse as a session"
+            );
+        }
     }
 
     #[test]

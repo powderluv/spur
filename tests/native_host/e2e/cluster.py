@@ -23,7 +23,7 @@ import tomli_w
 
 logger = logging.getLogger(__name__)
 
-BINARIES = ["spurctld", "spurd", "spur"]
+BINARIES = ["spurctld", "spurd", "spur", "spurstepd"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
@@ -769,9 +769,20 @@ class SpurCluster:
 
         for i, node in enumerate(self.nodes):
             agent_log = f"{self.log_dir}/spurd.log"
-            log = node.exec_allow_fail(f"tail -15 '{agent_log}'")
+            log = node.exec_allow_fail(f"tail -40 '{agent_log}'")
             if log.strip():
-                lines.append(f"spurd.log on {self.node_names[i]} (last 15 lines):\n{log}")
+                lines.append(f"spurd.log on {self.node_names[i]} (last 40 lines):\n{log}")
+
+        # Most tests assert on -o only, so a failure written to the job's
+        # stderr is otherwise invisible.
+        try:
+            match = re.search(r"StdErr=(\S+)", self.scontrol("show", "job", str(job_id)))
+            if match:
+                err = self.read_output_on_any_node(match.group(1))
+                if err.strip():
+                    lines.append(f"job stderr ({match.group(1)}):\n{err}")
+        except Exception:
+            pass
 
         return "\n".join(lines)
 
@@ -1329,6 +1340,7 @@ tar -C "$R" -czf '{local_tar}' .
             f"-f '{self.etc_dir}/spur.conf' "
             f"--controller '{self.controller_addr}' "
             f"--listen '{agent_listen}' "
+            f"--state-dir '{self.state_dir}' "
             f"--hostname '{hostname}' --address '{address}' --log-level info -D"
             f"{label_args}{token_arg} "
             f"> '{self.log_dir}/spurd.log' 2>&1 & echo $!"

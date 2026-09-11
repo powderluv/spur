@@ -3835,6 +3835,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-stepd"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "spurd",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "spur-tests"
 version = "0.11.0"
 dependencies = [
@@ -3935,6 +3945,7 @@ dependencies = [
  "spur-sched",
  "spur-spank",
  "spur-update",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3942,6 +3953,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

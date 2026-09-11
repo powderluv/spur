@@ -25,7 +25,7 @@ set -euo pipefail
 REPO="ROCm/spur"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
-BINARIES="spur spurctld spurd"
+BINARIES="spur spurctld spurd spurstepd"
 SYMLINKS="sbatch srun squeue scancel sinfo sacct scontrol"
 
 log()  { echo "==> $*"; }

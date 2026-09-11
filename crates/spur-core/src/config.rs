@@ -753,9 +753,12 @@ pub struct AuthConfig {
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// JWT secret key (file path or inline), signing and verifying both user credentials
-    /// (`spur token user`) and node admission tokens.
+    /// HMAC signing secret (inline), signing and verifying both user credentials
+    /// (`spur token user`) and node admission tokens; used literally, and the
+    /// resolved key is captured at startup, not updated by `reconfigure`.
     pub jwt_key: Option<String>,
+    /// Path to a regular file containing the JWT secret key.
+    pub jwt_key_file: Option<String>,
     /// Allow jobs to execute as uid 0 (root).
     ///
     /// Default false, and deliberately so: `uid` arrives on the wire as part of the job spec, and a
@@ -772,7 +775,67 @@ impl Default for AuthConfig {
             plugin: "jwt".into(),
             mode: AuthMode::default(),
             jwt_key: None,
+            jwt_key_file: None,
             allow_root_jobs: false,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Resolve the signing key once at process startup.
+    ///
+    /// `jwt_key` is always treated as a literal secret. `jwt_key_file` is the explicit
+    /// file-backed form. A trailing line ending in the file is ignored so a file created with
+    /// `echo` has the same secret as its inline form.
+    pub fn resolved_jwt_key(&self) -> Result<Option<String>, ConfigError> {
+        if self.jwt_key.is_some() && self.jwt_key_file.is_some() {
+            return Err(ConfigError::InvalidValue {
+                field: "auth".into(),
+                value: "jwt_key and jwt_key_file cannot both be set".into(),
+            });
+        }
+
+        if let Some(value) = &self.jwt_key {
+            if value.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.jwt_key".into(),
+                    value: "must not be blank".into(),
+                });
+            }
+            return Ok(Some(value.clone()));
+        }
+
+        let Some(path) = &self.jwt_key_file else {
+            return Ok(None);
+        };
+
+        let path = Path::new(path);
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.jwt_key_file".into(),
+                value: format!("{} is not a regular file", path.display()),
+            });
+        }
+
+        let key = std::fs::read_to_string(path)?;
+        let key = key.trim_end_matches(['\r', '\n']).to_owned();
+        if key.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.jwt_key_file".into(),
+                value: "contains a blank signing key".into(),
+            });
+        }
+        Ok(Some(key))
+    }
+
+    pub fn has_jwt_key(&self) -> bool {
+        match self.resolved_jwt_key() {
+            Ok(key) => key.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to resolve jwt key; treating as not configured");
+                false
+            }
         }
     }
 }
@@ -1905,8 +1968,9 @@ impl SlurmConfig {
         }
         // Without a key, `required` would fall back to a well-known signing constant —
         // forgeable, so strictly worse than the default. Refuse to start instead.
+        let resolved_jwt_key = self.auth.resolved_jwt_key()?;
         if self.auth.mode == AuthMode::Required
-            && self.auth.jwt_key.as_deref().unwrap_or("").is_empty()
+            && resolved_jwt_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::InvalidValue {
                 field: "auth.jwt_key".into(),
@@ -2340,6 +2404,95 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn auth_config_reads_an_explicit_jwt_key_file() {
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(key_file, "key-from-file").unwrap();
+        let config = SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key_file = {:?}\n",
+            key_file.path()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.auth.resolved_jwt_key().unwrap().as_deref(),
+            Some("key-from-file")
+        );
+    }
+
+    #[test]
+    fn auth_config_preserves_a_file_like_jwt_key_as_an_inline_secret() {
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        let config = SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = {:?}\n",
+            key_file.path()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.auth.resolved_jwt_key().unwrap().as_deref(),
+            key_file.path().to_str()
+        );
+    }
+
+    #[test]
+    fn auth_config_rejects_a_blank_inline_jwt_key() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \" \"\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("auth.jwt_key"));
+        assert!(!AuthConfig {
+            jwt_key: Some(" \n".into()),
+            ..Default::default()
+        }
+        .has_jwt_key());
+    }
+
+    #[test]
+    fn auth_config_rejects_a_blank_jwt_key_file() {
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(key_file).unwrap();
+        let error = SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key_file = {:?}\n",
+            key_file.path()
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("auth.jwt_key_file"));
+        assert!(!AuthConfig {
+            jwt_key_file: Some(key_file.path().display().to_string()),
+            ..Default::default()
+        }
+        .has_jwt_key());
+    }
+
+    #[test]
+    fn auth_config_rejects_a_directory_as_a_jwt_key_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AuthConfig {
+            jwt_key_file: Some(directory.path().display().to_string()),
+            ..Default::default()
+        };
+
+        let error = config.resolved_jwt_key().unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn auth_config_rejects_jwt_key_and_file_together() {
+        let config = AuthConfig {
+            jwt_key: Some("inline-secret".into()),
+            jwt_key_file: Some("/etc/spur/jwt.key".into()),
+            ..Default::default()
+        };
+
+        let error = config.resolved_jwt_key().unwrap_err();
+        assert!(error.to_string().contains("cannot both be set"));
+    }
 
     #[test]
     fn cgroup_config_defaults_match_intended_posture() {

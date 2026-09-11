@@ -64,6 +64,7 @@ RDMA
 README
 reconfigure
 reloadable
+reparented
 requeue
 requeued
 requeues
@@ -112,6 +113,7 @@ subcommand
 subcommands
 sysfs
 systemd
+systemd's
 TOML
 TRES
 UCX

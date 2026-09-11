@@ -10,6 +10,7 @@ members = [
 
     "crates/spurctld",
     "crates/spurd",
+    "crates/spur-stepd",
     "crates/spur-cli",
     "crates/spur-ffi",
     "crates/spur-spank",

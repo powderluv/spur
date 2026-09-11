@@ -658,6 +658,7 @@ mod tests {
         list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
         revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;
         report_job_status(pb::ReportJobStatusRequest) -> ();
+        report_stepd_recovery(pb::StepdRecoveryRequest) -> pb::StepdRecoveryResponse;
         create_reservation(pb::CreateReservationRequest) -> ();
         update_reservation(pb::UpdateReservationRequest) -> ();
         delete_reservation(pb::DeleteReservationRequest) -> ();

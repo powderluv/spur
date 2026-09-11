@@ -339,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
+    let jwt_key = server::resolve_startup_jwt_key(&config)?;
     server::serve(
         addr,
         cluster,
@@ -347,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         sched_stats,
         accounting_service,
         config.cluster.control_plane_replicas,
+        jwt_key,
     )
     .await?;
 

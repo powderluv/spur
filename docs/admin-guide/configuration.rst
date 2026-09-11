@@ -1204,7 +1204,7 @@ Job isolation layers.
 cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
 process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
 exec``, and interactive attach — runs in a cgroup at
-``/sys/fs/cgroup/spur/job_<id>``, and the limits are derived from the **per-node
+``/sys/fs/cgroup/spur/job_<id>_<attempt>``, and the limits are derived from the **per-node
 budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
 the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
 cgroups.
@@ -1436,11 +1436,11 @@ Verify what a running job actually got:
 
 .. code-block:: bash
 
-   cat /sys/fs/cgroup/spur/job_1234/cpuset.cpus       # allocated cores
-   cat /sys/fs/cgroup/spur/job_1234/memory.max        # hard ceiling, bytes
-   cat /sys/fs/cgroup/spur/job_1234/memory.high       # reclaim threshold
-   cat /sys/fs/cgroup/spur/job_1234/memory.swap.max   # swap ceiling
-   bpftool cgroup show /sys/fs/cgroup/spur/job_1234   # attached device filter
+   cat /sys/fs/cgroup/spur/job_1234_1/cpuset.cpus       # allocated cores
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.max        # hard ceiling, bytes
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.high       # reclaim threshold
+   cat /sys/fs/cgroup/spur/job_1234_1/memory.swap.max   # swap ceiling
+   bpftool cgroup show /sys/fs/cgroup/spur/job_1234_1   # attached device filter
 
 Migrating from ``cgroup.conf``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
