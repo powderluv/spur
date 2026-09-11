@@ -91,7 +91,11 @@ impl VirtualAgent {
                 let mut items = list.items.into_iter();
                 match (items.next(), items.next()) {
                     (None, _) => Err(Status::not_found(format!(
-                        "spur.amd.com/job-id={job_id} label not yet visible"
+                        "no SpurJob carries the label spur.amd.com/job-id={job_id}. In Pod mode \
+                         the operator makes Pods only for a SpurJob custom resource, so a job \
+                         submitted with the CLI (sbatch, spur submit) has nothing to launch. \
+                         Submit it with `kubectl apply` of a SpurJob instead. If this job DID \
+                         come from a SpurJob, the label is not visible yet and this is retried."
                     ))),
                     (Some(job), None) => Ok(job),
                     (Some(_), Some(_)) => Err(Status::failed_precondition(format!(
@@ -249,8 +253,14 @@ impl SlurmAgent for VirtualAgent {
 
         senv.set("SPUR_TASK_OFFSET", req.task_offset);
         senv.set("SPUR_NODE_RANK", node_rank);
-        if !peer_nodes.is_empty() {
-            senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
+        // The controller sends agent addresses in `peer_nodes`. In Pod mode every
+        // node answers on the one operator address, so that list is the same
+        // address repeated and no workload can reach a peer with it. The Pods of a
+        // multi-node job are reachable under the headless Service instead, because
+        // each Pod takes its target node as its hostname.
+        let peer_dns = headless_peer_dns(&spec.nodelist, job_id, &ns);
+        if !peer_dns.is_empty() {
+            senv.set("SPUR_PEER_NODES", peer_dns.join(","));
         }
         if !target_node.is_empty() {
             senv.set("SPUR_TARGET_NODE", &target_node);
@@ -955,6 +965,37 @@ fn sanitize_k8s_name(s: &str) -> String {
         .to_string()
 }
 
+/// The DNS names under which the Pods of a multi-node job reach each other.
+///
+/// `launch_job` gives each Pod `hostname = sanitize_k8s_name(target_node)` and
+/// `subdomain = spur-job-<id>`, and `ensure_headless_service` publishes that
+/// Service, so every peer answers at
+/// `<hostname>.spur-job-<id>.<namespace>.svc.cluster.local`. The order follows
+/// the nodelist, so index N is the peer whose SPUR_NODE_RANK is N.
+///
+/// A single node job gets no headless Service and therefore no name to return.
+fn headless_peer_dns(nodelist: &str, job_id: u32, namespace: &str) -> Vec<String> {
+    let nodes: Vec<&str> = nodelist
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if nodes.len() < 2 {
+        return Vec::new();
+    }
+    nodes
+        .iter()
+        .map(|n| {
+            format!(
+                "{}.spur-job-{}.{}.svc.cluster.local",
+                sanitize_k8s_name(n),
+                job_id,
+                namespace
+            )
+        })
+        .collect()
+}
+
 /// Determine the K8s device plugin resource key based on GPU type.
 ///
 /// AMD GPUs (mi300x, mi250x, gfx*, etc.) → "amd.com/gpu"
@@ -1281,5 +1322,35 @@ mod tests {
         assert_eq!(gpu_request_to_gres(8, Some("mi300x")), "gpu:mi300x:8");
         assert_eq!(gpu_request_to_gres(4, Some("mi250x")), "gpu:mi250x:4");
         assert_eq!(gpu_request_to_gres(1, Some("gfx942")), "gpu:gfx942:1");
+    }
+}
+
+#[cfg(test)]
+mod peer_dns_tests {
+    use super::headless_peer_dns;
+
+    #[test]
+    fn multi_node_job_gets_one_resolvable_name_per_node_in_nodelist_order() {
+        let out = headless_peer_dns("node-a,node-b,node-c", 7, "spur");
+        assert_eq!(
+            out,
+            vec![
+                "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-c.spur-job-7.spur.svc.cluster.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_node_job_gets_nothing_because_it_has_no_headless_service() {
+        assert!(headless_peer_dns("node-a", 7, "spur").is_empty());
+        assert!(headless_peer_dns("", 7, "spur").is_empty());
+    }
+
+    #[test]
+    fn node_names_are_sanitized_the_same_way_as_the_pod_hostname() {
+        let out = headless_peer_dns("Node_A.example,node-b", 3, "ns");
+        assert_eq!(out[0], "node-a-example.spur-job-3.ns.svc.cluster.local");
     }
 }
