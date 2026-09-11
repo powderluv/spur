@@ -132,29 +132,30 @@ flags above apply to a step's ``srun`` and behave as follows:
   container for that step. Different steps in one allocation can use different
   images and mounts.
 
-Allocate first, then run steps from inside the allocation shell. A single step
-fans out one container per allocated node:
+Allocate first, then run steps from inside the allocation shell. By default a
+single step fans out one container per allocated node; ``-N`` or ``-w`` limits
+container creation or entry to the selected step nodes:
 
 .. code-block:: bash
 
    salloc -N2 --gpus-per-node=8
    # ...now inside the allocation shell:
    srun --container-image trainer.sqsh <command>   # one container per node
+   srun -N1 --container-image trainer.sqsh <command>   # one allocated node
+   srun -w node002 --container-image trainer.sqsh <command>   # exact node
 
 .. note::
 
-   A step is dispatched to every node in the allocation; per-node targeting of
-   an individual step (``-w``/``--nodelist``) is not yet honored for steps, and
-   ``--overlap`` only applies within an allocation (it keys off
-   ``SPUR_JOB_ID``). For per-node roles (e.g. a Ray head vs. workers), branch on
-   ``$SPUR_NODE_RANK`` inside the step command.
+   ``-N`` and ``-w`` only choose which allocated nodes run the step. They do not
+   resize the job-level CPU, memory, or GPU cgroup on those nodes.
 
 GPU allocation, bind mounts, and cancellation apply per step: a cancelled step
 tears down its container and cleans up its rootfs without affecting the rest of
 the allocation.
 
 Interactive steps (``srun --pty``) run inside the container too — you get a real
-terminal inside the container rather than on the host. The step uses its own
+terminal inside the container rather than on the host. ``--pty`` still ignores
+``--nodes`` and uses only the first ``-w`` name. The step uses its own
 ``--container-image`` when given one, otherwise a nested ``srun --pty`` inherits
 the image from its containerized ``sbatch`` job:
 

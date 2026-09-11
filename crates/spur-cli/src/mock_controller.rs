@@ -35,6 +35,8 @@ pub(crate) struct StepCapture {
     /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
     get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
     create_step_num_tasks: Arc<AtomicU32>,
+    create_step_num_nodes: Arc<AtomicU32>,
+    create_step_nodelist: Arc<Mutex<String>>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
@@ -64,6 +66,14 @@ impl StepCapture {
     /// Task count carried by the most recent `CreateJobStep`.
     pub(crate) fn create_step_num_tasks(&self) -> u32 {
         self.create_step_num_tasks.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn create_step_num_nodes(&self) -> u32 {
+        self.create_step_num_nodes.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn create_step_nodelist(&self) -> String {
+        self.create_step_nodelist.lock().unwrap().clone()
     }
 
     /// Make `create_job_step` fail, so tests can drive the pre-step failure path.
@@ -146,9 +156,14 @@ mock_controller_impl! {
             &self,
             request: tonic::Request<proto::CreateJobStepRequest>,
         ) -> Result<tonic::Response<proto::CreateJobStepResponse>, tonic::Status> {
+            let request = request.into_inner();
             self.capture
                 .create_step_num_tasks
-                .store(request.into_inner().num_tasks, Ordering::SeqCst);
+                .store(request.num_tasks, Ordering::SeqCst);
+            self.capture
+                .create_step_num_nodes
+                .store(request.num_nodes, Ordering::SeqCst);
+            *self.capture.create_step_nodelist.lock().unwrap() = request.nodelist;
             if let Some(code) = *self.capture.create_step_error.lock().unwrap() {
                 return Err(tonic::Status::new(code, "mock create_job_step failure"));
             }

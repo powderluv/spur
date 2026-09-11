@@ -39,10 +39,12 @@ Common options:
      - Description
    * - ``--nodes``
      - ``-N``
-     - Number of nodes. Default ``1``.
+     - Number of nodes. Standalone default ``1``; a nested step inherits the
+       allocation unless ``-N`` is typed.
    * - ``--ntasks``
      - ``-n``
-     - Number of tasks. Default ``1``.
+     - Number of tasks. Standalone default ``1``; a nested step inherits
+       ``SPUR_NTASKS`` / ``SLURM_NTASKS`` unless ``-n`` is typed.
    * - ``--cpus-per-task``
      - ``-c``
      - CPUs per task. Default ``1``.
@@ -120,13 +122,23 @@ to the controller. ``SPUR_JOB_USER`` records the job owner bound at submit time
 (for example the JWT subject); ``srun`` inside the shell uses it when step RPCs
 run without a token.
 
-Inside that shell, ``srun`` runs as a job step sized to the allocation.
+Inside that shell, ``srun`` runs as a job step. With no step-level ``-N`` or
+``-w``, it uses the allocation's nodes and inherits the allocation's task count
+(``SPUR_NTASKS`` / ``SLURM_NTASKS``). For **buffered** steps, ``-N``/``--nodes``
+limits the step to that many allocated nodes without dropping that inherited
+task count, and ``-w``/``--nodelist`` selects an exact subset of allocated
+nodes. A step cannot request more nodes than its allocation.
 
-Common options: ``--nodes``/``-N`` (default ``1``), ``--ntasks``/``-n`` (default
-``1``), ``--cpus-per-task``/``-c`` (default ``1``), ``--mem``, ``--time``/``-t``
-(default ``1:00:00``), ``--gres``, ``--gpus``/``-G``, ``--partition``/``-p``,
-``--constraint``/``-C``, ``--nodelist``/``-w``, ``--exclude``/``-x``,
-``--reservation``, and ``--exclusive``.
+``--pty`` does not follow those node-selection rules: it still ignores
+``--nodes`` (one task on one node) and, with ``-w``, uses only the first listed
+name.
+
+The ``-N``/``-n`` defaults of 1 apply when ``srun`` submits a **new** job, not
+when it runs as a step inside ``salloc``/``sbatch``. Common options: ``--nodes``/
+``-N``, ``--ntasks``/``-n``, ``--cpus-per-task``/``-c``, ``--mem``, ``--time``/
+``-t``, ``--gres``, ``--gpus``/``-G``, ``--partition``/``-p``, ``--constraint``/
+``-C``, ``--nodelist``/``-w``, ``--exclude``/``-x``, ``--reservation``, and
+``--exclusive``.
 
 Examples:
 

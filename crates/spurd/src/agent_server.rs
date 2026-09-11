@@ -1867,6 +1867,30 @@ struct StepScriptCleanup {
     paths: Vec<std::path::PathBuf>,
 }
 
+impl StepScriptCleanup {
+    fn stage_in_rootfs(&self, rootfs: &std::path::Path, uid: u32, gid: u32) -> anyhow::Result<()> {
+        for source in &self.paths {
+            let relative = source
+                .strip_prefix("/")
+                .map_err(|_| anyhow::anyhow!("step script path must be absolute"))?;
+            if relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                anyhow::bail!("step script path contains unsupported components");
+            }
+            let destination = rootfs.join(relative);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("step script has no parent directory"))?;
+            std::fs::create_dir_all(parent)?;
+            let content = std::fs::read_to_string(source)?;
+            crate::executor::write_job_scratch(&destination, &content, uid, gid)?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for StepScriptCleanup {
     fn drop(&mut self) {
         let path_refs: Vec<&std::path::Path> =
@@ -3125,13 +3149,24 @@ impl SlurmAgent for AgentService {
             )
         };
 
+        let job_nodelist = nodelist;
+        let step_nodelist = if req.nodelist.trim().is_empty() {
+            job_nodelist.clone()
+        } else {
+            req.nodelist.clone()
+        };
         let agent_hostname = self.reporter.hostname.clone();
-        let node_names: Vec<&str> = nodelist.split(',').filter(|s| !s.is_empty()).collect();
+        let node_names: Vec<&str> = step_nodelist.split(',').filter(|s| !s.is_empty()).collect();
         let num_nodes = node_names.len().max(1) as u32;
         let node_id = node_names
             .iter()
             .position(|n| *n == agent_hostname)
             .unwrap_or(0) as u32;
+        let job_num_nodes = job_nodelist
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .count()
+            .max(1) as u32;
 
         let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
             (HashMap::new(), None)
@@ -3153,8 +3188,8 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
         senv.set_with_slurm_twin("SPUR_JOBID", job_id);
         senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
-        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
-        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &step_nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &job_nodelist);
         senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
         senv.extend(&gpu_env);
         let mut bind_env = HashMap::new();
@@ -3182,6 +3217,7 @@ impl SlurmAgent for AgentService {
             node_id,
             num_nodes,
         );
+        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job_num_nodes);
         if req.label {
             senv.set("SPUR_LABEL", "1");
         }
@@ -3299,7 +3335,7 @@ impl SlurmAgent for AgentService {
                 uid: req.uid,
                 gid: req.gid,
                 partition: partition.clone(),
-                nodelist: nodelist.clone(),
+                nodelist: job_nodelist.clone(),
                 script_context: "prolog_task".into(),
                 gpu_devices: gpu_devices.clone(),
                 cpus,
@@ -3524,6 +3560,16 @@ impl SlurmAgent for AgentService {
                 pid: None,
             };
 
+            // Multi-task and labeled commands use agent-generated wrappers. A
+            // fresh container cannot see their host paths after pivot_root.
+            if let Some(ref scripts) = _step_script_guard {
+                scripts
+                    .stage_in_rootfs(&rootfs, step_uid, step_gid)
+                    .map_err(|e| {
+                        Status::internal(format!("failed to stage step scripts in container: {e}"))
+                    })?;
+            }
+
             // Write the step command as a script inside the rootfs so it's
             // accessible after pivot_root hides the host filesystem.
             let step_script_content = {
@@ -3624,7 +3670,7 @@ impl SlurmAgent for AgentService {
                 uid: req.uid,
                 gid: req.gid,
                 partition,
-                nodelist,
+                nodelist: job_nodelist,
                 script_context: "epilog_task".into(),
                 gpu_devices,
                 cpus,
@@ -6494,6 +6540,70 @@ mod tests {
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout.trim(), "step-dispatched");
+    }
+
+    #[tokio::test]
+    async fn run_command_uses_step_nodelist_for_node_env() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        static NEXT_JOB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(9000);
+        let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.nodelist = "n1,n2,test-node".into();
+        svc.insert_test_job(job_id, tracked).await;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s %s %s %s %s' \"$SPUR_NODEID\" \"$SPUR_NNODES\" \"$SPUR_NODELIST\" \"$SPUR_JOB_NODELIST\" \"$SPUR_JOB_NUM_NODES\""
+                    .into(),
+            ],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            nodelist: "test-node".into(),
+            ..Default::default()
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "0 1 test-node n1,n2,test-node 3");
+    }
+
+    #[test]
+    fn step_scripts_are_staged_at_their_container_paths() {
+        let work = tempfile::TempDir::new().unwrap();
+        let rootfs = tempfile::TempDir::new().unwrap();
+        let dir = work.path().join(".spur_step_1");
+        std::fs::create_dir(&dir).unwrap();
+        let command = dir.join("cmd_0.sh");
+        let wrapper = dir.join("wrapper_0.sh");
+        std::fs::write(&command, "#!/bin/bash\necho staged\n").unwrap();
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/bash\nbash {}\n", command.display()),
+        )
+        .unwrap();
+        let scripts = StepScriptCleanup {
+            dir,
+            paths: vec![command.clone(), wrapper.clone()],
+        };
+
+        scripts.stage_in_rootfs(rootfs.path(), 0, 0).unwrap();
+
+        for source in [&command, &wrapper] {
+            let destination = rootfs.path().join(source.strip_prefix("/").unwrap());
+            assert_eq!(
+                std::fs::read_to_string(destination).unwrap(),
+                std::fs::read_to_string(source).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

@@ -1258,6 +1258,9 @@ message RunCommandRequest {
   // Container for this step. Absent/empty image = no container; the step runs
   // on the host or enters the parent job's namespaces when it is containerized.
   ContainerSpec container = 15;
+  // Step node subset (comma-separated names). Empty = use the job allocation
+  // nodelist. Drives SPUR_NODELIST / SPUR_NNODES / SPUR_NODEID for the step.
+  string nodelist = 16;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1667,15 +1670,17 @@ message CreateJobStepRequest {
   bool overlap = 5;           // Share resources with existing step (--overlap)
   bool pty = 6;               // Allocate a PTY for the step
   WindowSize winsize = 7;     // Initial terminal dimensions
-  string node = 8;            // Target node (-w); empty = first allocated node
+  string node = 8;            // Legacy single-node/PTY target; empty = first selected node
   string user = 9;            // Requesting user; verified identity must own the job; the controller/admin credential overrides
   uint32 uid = 10;            // Caller Unix uid for Munge-like ownership when unauthenticated; 0 = absent
   ContainerSpec container = 11;  // Step's own container request (empty image = none/inherit)
+  uint32 num_nodes = 12;       // Explicit step node count (-N); 0 = use all allocated nodes
+  string nodelist = 13;        // Exact step node subset (-w); empty = derive from num_nodes/allocation
 }
 
 message CreateJobStepResponse {
   uint32 step_id = 1;
-  string node_addr = 2;        // Address of the selected node (-w target, else first allocated); host:port for agent
+  string node_addr = 2;        // Address of the first resolved step node; host:port for agent
   ContainerSpec container = 3; // Effective container for the step (step's own, else inherited from the job); empty image = host
 }
 

@@ -2129,16 +2129,25 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let target_node =
-            select_step_node(&job.allocated_nodes, &req.node).map_err(Status::invalid_argument)?;
+        let step_nodes = resolve_step_nodes(
+            &job.allocated_nodes,
+            req.num_nodes,
+            &req.nodelist,
+            &req.node,
+        )
+        .map_err(Status::invalid_argument)?;
+        let target_node = step_nodes
+            .first()
+            .cloned()
+            .ok_or_else(|| Status::failed_precondition("resolved step has no nodes"))?;
 
         // Resolve the target agent address BEFORE creating the step: an unregistered node returns a
         // retryable Unavailable and the client retries the whole call, so resolving first keeps a
         // failed attempt from leaking a step per retry.
-        let node = self.cluster.get_node(target_node).ok_or_else(|| {
+        let node = self.cluster.get_node(&target_node).ok_or_else(|| {
             Status::unavailable(format!("node {target_node} is not currently registered"))
         })?;
-        let node_addr = node_comm_socket(&node, target_node)?;
+        let node_addr = node_comm_socket(&node, &target_node)?;
 
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
@@ -2154,7 +2163,7 @@ impl SlurmController for ControllerService {
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
             resources: spur_core::resource::ResourceAllocations::default(),
-            nodes: job.allocated_nodes.clone(),
+            nodes: step_nodes,
             distribution: spur_core::step::TaskDistribution::Block,
             start_time: Some(chrono::Utc::now()),
             end_time: None,
@@ -2825,7 +2834,16 @@ impl SlurmController for ControllerService {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
-        let num_nodes = job.allocated_nodes.len() as u32;
+        validate_step_nodes_for_run(
+            job_id,
+            req.step_id,
+            step.state,
+            &step.nodes,
+            &job.allocated_nodes,
+        )
+        .map_err(Status::failed_precondition)?;
+
+        let num_nodes = step.nodes.len() as u32;
         let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
         if plan.is_empty() {
             return Err(Status::failed_precondition(format!(
@@ -2859,35 +2877,28 @@ impl SlurmController for ControllerService {
         let mut dispatches = Vec::new();
         let mut dispatch_errors = Vec::new();
 
-        for node_tasks in plan {
-            let node_name = match job.allocated_nodes.get(node_tasks.node_index as usize) {
-                Some(name) => name.clone(),
-                None => {
-                    dispatch_errors.push(format!(
-                        "step plan references node index {} but job {} has {} nodes",
-                        node_tasks.node_index,
-                        job_id,
-                        job.allocated_nodes.len()
-                    ));
-                    continue;
+        match map_step_plan_to_nodes(&step.nodes, &plan, job_id, step_id) {
+            Ok(targets) => {
+                for (node_name, node_tasks) in targets {
+                    let Some(node) = self.cluster.get_node(&node_name) else {
+                        dispatch_errors.push(format!("node {node_name} not found"));
+                        continue;
+                    };
+                    let agent_addr = match node_comm_http_url(&node, &node_name) {
+                        Ok(url) => url,
+                        Err(e) => {
+                            dispatch_errors.push(format!("node {node_name}: {e}"));
+                            continue;
+                        }
+                    };
+                    dispatches.push(NodeDispatch {
+                        node_name,
+                        agent_addr,
+                        node_tasks,
+                    });
                 }
-            };
-            let Some(node) = self.cluster.get_node(&node_name) else {
-                dispatch_errors.push(format!("node {node_name} not found"));
-                continue;
-            };
-            let agent_addr = match node_comm_http_url(&node, &node_name) {
-                Ok(url) => url,
-                Err(e) => {
-                    dispatch_errors.push(format!("node {node_name}: {e}"));
-                    continue;
-                }
-            };
-            dispatches.push(NodeDispatch {
-                node_name,
-                agent_addr,
-                node_tasks,
-            });
+            }
+            Err(errors) => dispatch_errors.extend(errors),
         }
 
         if !dispatch_errors.is_empty() {
@@ -2905,7 +2916,7 @@ impl SlurmController for ControllerService {
                         .map(|dispatch| dispatch.node_tasks.node_index)
                         .collect(),
                     |idx| {
-                        let name = job.allocated_nodes.get(idx as usize)?;
+                        let name = step.nodes.get(idx as usize)?;
                         self.cluster
                             .get_node(name)
                             .and_then(|n| n.comm_addr().map(str::to_string))
@@ -2925,6 +2936,7 @@ impl SlurmController for ControllerService {
             )
         });
         let run_attempt = job.run_attempt;
+        let step_nodelist = step.nodes.join(",");
 
         let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
             if let Some(peers) = pmix_peers.as_ref() {
@@ -3015,6 +3027,7 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             let container = step_container.clone();
+            let step_nodelist = step_nodelist.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -3041,6 +3054,7 @@ impl SlurmController for ControllerService {
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
                         container,
+                        nodelist: step_nodelist.clone(),
                     })
                     .await
                     .map_err(|e| {
@@ -3723,6 +3737,113 @@ fn resolve_step_container(
             Some(step)
         }
         None => container_spec_from_job_spec(job_spec),
+    }
+}
+
+fn resolve_step_nodes(
+    allocated: &[String],
+    requested_count: u32,
+    requested_list: &str,
+    legacy_node: &str,
+) -> Result<Vec<String>, String> {
+    if allocated.is_empty() {
+        return Err("job has no allocated nodes".to_string());
+    }
+
+    if !requested_list.is_empty() {
+        let requested = spur_core::hostlist::expand(requested_list)
+            .map_err(|e| format!("invalid step nodelist: {e}"))?;
+        if requested.is_empty() {
+            return Err("step nodelist expands to no nodes".to_string());
+        }
+        let mut seen = HashSet::new();
+        for node in &requested {
+            if !seen.insert(node) {
+                return Err(format!(
+                    "node {node} appears more than once in the step nodelist"
+                ));
+            }
+            if !allocated.contains(node) {
+                return Err(format!("node {node} is not allocated to this job"));
+            }
+        }
+        if requested_count > 0 && requested_count as usize != requested.len() {
+            return Err(format!(
+                "num_nodes requests {requested_count} node(s), but nodelist names {}",
+                requested.len()
+            ));
+        }
+        return Ok(requested);
+    }
+
+    if !legacy_node.is_empty() {
+        let node = select_step_node(allocated, legacy_node)?;
+        return Ok(vec![node.to_string()]);
+    }
+
+    if requested_count == 0 {
+        return Ok(allocated.to_vec());
+    }
+    if requested_count as usize > allocated.len() {
+        return Err(format!(
+            "step requests {requested_count} node(s), but job has only {} allocated",
+            allocated.len()
+        ));
+    }
+
+    Ok(allocated[..requested_count as usize].to_vec())
+}
+
+fn validate_step_nodes_for_run(
+    job_id: u32,
+    step_id: u32,
+    state: spur_core::step::StepState,
+    step_nodes: &[String],
+    allocated: &[String],
+) -> Result<(), String> {
+    if state != spur_core::step::StepState::Running {
+        return Err(format!(
+            "step {job_id}.{step_id} is {} and cannot run",
+            state.display()
+        ));
+    }
+    if step_nodes.is_empty() {
+        return Err(format!("step {job_id}.{step_id} has no nodes"));
+    }
+    for node in step_nodes {
+        if !allocated.contains(node) {
+            return Err(format!(
+                "step node {node} is not in the job's current allocation"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn map_step_plan_to_nodes(
+    step_nodes: &[String],
+    plan: &[spur_core::task_launch::NodeStepTasks],
+    job_id: u32,
+    step_id: u32,
+) -> Result<Vec<(String, spur_core::task_launch::NodeStepTasks)>, Vec<String>> {
+    let mut targets = Vec::with_capacity(plan.len());
+    let mut errors = Vec::new();
+    for node_tasks in plan {
+        match step_nodes.get(node_tasks.node_index as usize) {
+            Some(name) => targets.push((name.clone(), node_tasks.clone())),
+            None => errors.push(format!(
+                "step plan references node index {} but step {}.{} has {} nodes",
+                node_tasks.node_index,
+                job_id,
+                step_id,
+                step_nodes.len()
+            )),
+        }
+    }
+    if errors.is_empty() {
+        Ok(targets)
+    } else {
+        Err(errors)
     }
 }
 
@@ -6596,6 +6717,113 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_persists_requested_node_subset() {
+        use spur_core::job::JobState;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        for name in ["n1", "n2", "n3"] {
+            svc.cluster
+                .register_node(
+                    name.into(),
+                    name.into(),
+                    ResourceSet {
+                        cpus: 8,
+                        memory_mb: 16000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                    true,
+                )
+                .unwrap();
+        }
+        for _ in 0..200 {
+            if ["n1", "n2", "n3"]
+                .iter()
+                .all(|name| svc.cluster.get_node(name).is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let spec = spur_core::job::JobSpec {
+            name: "subset".into(),
+            user: "u".into(),
+            num_nodes: 3,
+            num_tasks: 3,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> = ["n1", "n2", "n3"]
+            .into_iter()
+            .map(|name| (name.to_string(), res.clone()))
+            .collect();
+        svc.cluster
+            .start_job(
+                job_id,
+                vec!["n1".into(), "n2".into(), "n3".into()],
+                res,
+                per_node,
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let counted = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                num_tasks: 4,
+                cpus_per_task: 1,
+                user: "u".into(),
+                num_nodes: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect("prefix subset must be accepted")
+            .into_inner()
+            .step_id;
+        assert_eq!(
+            svc.cluster.get_step(job_id, counted).unwrap().nodes,
+            vec!["n1".to_string()]
+        );
+
+        let named = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                num_tasks: 1,
+                cpus_per_task: 1,
+                user: "u".into(),
+                nodelist: "n2".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("named subset must be accepted")
+            .into_inner()
+            .step_id;
+        assert_eq!(
+            svc.cluster.get_step(job_id, named).unwrap().nodes,
+            vec!["n2".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_job_step_allows_uid_match_despite_username_mismatch() {
         use spur_core::job::JobState;
         use spur_core::resource::{ResourceAllocations, ResourceSet};
@@ -6666,6 +6894,8 @@ mod tests {
                 user: "local-wire-name".into(),
                 uid: owner_uid,
                 container: None,
+                num_nodes: 0,
+                nodelist: String::new(),
             }))
             .await
             .expect("uid match must authorize step creation despite username mismatch");
@@ -6805,6 +7035,97 @@ mod tests {
             .expect_err("a non-owner must not run a step in another user's allocation");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_rejects_completed_step() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "done".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: allocated_nodes,
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+            })
+            .expect("test setup: seed step");
+        svc.cluster
+            .record_step_complete(job_id, 0, 0)
+            .expect("test setup: complete step");
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a completed step must not run");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("COMPLETED"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_rejects_nodes_no_longer_allocated() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "stale".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["gone".into()],
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+            })
+            .expect("test setup: seed step with stale nodes");
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a step whose nodes left the allocation must not run");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("not in the job's current allocation"),
+            "unexpected message: {}",
+            err.message()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7608,6 +7929,107 @@ mod tests {
     fn select_step_node_rejects_comma_joined_request() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
         assert!(select_step_node(&allocated, "node001,node002").is_err());
+    }
+
+    #[test]
+    fn resolve_step_nodes_uses_requested_count_prefix() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        assert_eq!(
+            resolve_step_nodes(&allocated, 2, "", "").unwrap(),
+            vec!["node001".to_string(), "node002".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_step_nodes_honors_exact_nodelist() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        assert_eq!(
+            resolve_step_nodes(&allocated, 0, "node[003,001]", "").unwrap(),
+            vec!["node003".to_string(), "node001".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_step_nodes_rejects_unallocated_and_oversized_requests() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert!(resolve_step_nodes(&allocated, 3, "", "")
+            .unwrap_err()
+            .contains("only 2 allocated"));
+        assert!(resolve_step_nodes(&allocated, 0, "node003", "")
+            .unwrap_err()
+            .contains("not allocated"));
+    }
+
+    #[test]
+    fn resolve_step_nodes_rejects_conflicting_count_and_nodelist() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert!(resolve_step_nodes(&allocated, 1, "node[001-002]", "")
+            .unwrap_err()
+            .contains("nodelist names 2"));
+    }
+
+    #[test]
+    fn validate_step_nodes_for_run_requires_running_on_allocated_nodes() {
+        use spur_core::step::StepState;
+        let allocated = vec!["n1".to_string(), "n2".to_string()];
+        validate_step_nodes_for_run(1, 0, StepState::Running, &["n1".into()], &allocated)
+            .expect("running step on an allocated node is valid");
+        assert!(validate_step_nodes_for_run(
+            1,
+            0,
+            StepState::Completed,
+            &["n1".into()],
+            &allocated
+        )
+        .unwrap_err()
+        .contains("COMPLETED"));
+        assert!(
+            validate_step_nodes_for_run(1, 0, StepState::Pending, &["n1".into()], &allocated)
+                .unwrap_err()
+                .contains("PENDING")
+        );
+        assert!(validate_step_nodes_for_run(
+            1,
+            0,
+            StepState::Running,
+            &["gone".into()],
+            &allocated
+        )
+        .unwrap_err()
+        .contains("not in the job's current allocation"));
+        assert!(
+            validate_step_nodes_for_run(1, 0, StepState::Running, &[], &allocated)
+                .unwrap_err()
+                .contains("has no nodes")
+        );
+    }
+
+    #[test]
+    fn map_step_plan_to_nodes_indexes_step_subset_not_full_allocation() {
+        use spur_core::step::TaskDistribution;
+        use spur_core::task_launch::build_step_task_plan;
+
+        let allocated = vec!["n1".to_string(), "n2".to_string(), "n3".to_string()];
+        let step_nodes = vec!["n2".to_string()];
+        let plan = build_step_task_plan(4, step_nodes.len() as u32, TaskDistribution::Block);
+        let names: Vec<String> = map_step_plan_to_nodes(&step_nodes, &plan, 7, 1)
+            .expect("subset must map")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["n2".to_string()]);
+        assert_ne!(
+            names, allocated,
+            "fan-out must not walk the full job allocation"
+        );
     }
 
     #[test]

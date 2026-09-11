@@ -794,6 +794,8 @@ async fn emit_step_output(
 
 struct StepDispatchParams<'a> {
     args: &'a SrunArgs,
+    explicit_num_nodes: Option<u32>,
+    requested_nodelist: Option<&'a str>,
     work_dir: &'a str,
     io: &'a ResolvedIoPaths,
     mpi: &'a str,
@@ -825,6 +827,8 @@ async fn dispatch_step(
             // The buffered path carries the container on RunStep; this call only
             // registers the step to obtain its id.
             container: None,
+            num_nodes: params.explicit_num_nodes.unwrap_or(0),
+            nodelist: params.requested_nodelist.unwrap_or_default().to_string(),
         })
         .await
         .context("failed to create job step")?
@@ -1029,6 +1033,8 @@ async fn run_standalone_srun(
     if job.srun_step_dispatch {
         let step_params = StepDispatchParams {
             args,
+            explicit_num_nodes: None,
+            requested_nodelist: None,
             work_dir,
             io: &io,
             mpi,
@@ -1510,6 +1516,8 @@ async fn run_interactive_pty(
                         user: user.to_string(),
                         uid: nix::unistd::geteuid().as_raw(),
                         container: container.clone(),
+                        num_nodes: 0,
+                        nodelist: String::new(),
                     })
                     .await
                 {
@@ -1597,17 +1605,6 @@ fn step_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
         warnings.push("srun: warning: --input is not supported for a job step, ignoring".into());
     }
     warnings
-}
-
-/// `-w` reaches a `--pty` step through CreateJobStep, but a buffered step inside
-/// an existing allocation runs on all of its nodes, so say so rather than drop it.
-fn buffered_step_unsupported_warnings(args: &SrunArgs) -> Vec<String> {
-    if args.nodelist.is_some() {
-        return vec!["srun: warning: --nodelist is not applied to a job step; \
-             the step runs on the job's allocated nodes"
-            .into()];
-    }
-    Vec::new()
 }
 
 /// Flags a `--pty` step drops. Sizing reads `matches`, not `args`: salloc exports
@@ -1704,7 +1701,7 @@ async fn run_as_step(
     // before it, so warn here — and before the controller round-trip.
     let dispatch_kind = step_dispatch_kind(args);
     let warnings = match dispatch_kind {
-        StepDispatchKind::Buffered => buffered_step_unsupported_warnings(args),
+        StepDispatchKind::Buffered => Vec::new(),
         StepDispatchKind::Interactive { .. } => step_unsupported_warnings(args)
             .into_iter()
             .chain(pty_step_unsupported_warnings(args, matches))
@@ -1742,6 +1739,8 @@ async fn run_as_step(
 
     let step_params = StepDispatchParams {
         args,
+        explicit_num_nodes: was_cli_set(matches, "nodes").then_some(args.nodes),
+        requested_nodelist: args.nodelist.as_deref(),
         work_dir,
         io: &io,
         mpi: step_mpi,
@@ -1920,14 +1919,6 @@ mod tests {
         assert!(warnings[0].contains("first entry of --nodelist"));
     }
 
-    #[test]
-    fn buffered_step_warns_that_nodelist_is_dropped() {
-        let (args, _) = parse_srun(&["srun", "-w", "n1", "hostname"]);
-        let warnings = buffered_step_unsupported_warnings(&args);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("--nodelist is not applied"));
-    }
-
     /// A lost `\` continuation in a wrapped string literal leaves a run of
     /// spaces in output that no behavioral assertion would catch.
     #[test]
@@ -1939,11 +1930,10 @@ mod tests {
         let all: Vec<String> = step_unsupported_warnings(&args)
             .into_iter()
             .chain(pty_step_unsupported_warnings(&args, &matches))
-            .chain(buffered_step_unsupported_warnings(&args))
             .collect();
         // Every dropped-flag warning, so a lost continuation in any of them is
         // caught here.
-        assert_eq!(all.len(), 7, "expected every warning to fire: {all:?}");
+        assert_eq!(all.len(), 6, "expected every warning to fire: {all:?}");
         for w in &all {
             assert!(!w.contains("  "), "collapsed continuation in: {w:?}");
             assert!(w.starts_with("srun: warning: "), "{w:?}");
@@ -2662,6 +2652,22 @@ mod tests {
         assert_eq!(overridden.ntasks, Some(1));
     }
 
+    #[test]
+    #[serial(env_injection)]
+    fn explicit_nodes_keeps_inherited_allocation_ntasks() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", "4");
+        env.set("SLURM_JOB_NUM_NODES", "4");
+
+        let args = resolve_from(&["srun", "-N", "1", "hostname"]);
+        assert_eq!(args.nodes, 1);
+        assert_eq!(args.ntasks, Some(4));
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            4
+        );
+    }
+
     /// Outside an allocation there is no `SLURM_NTASKS` to inherit, so the task
     /// count follows the node count — including when `-N` itself came from env.
     #[test]
@@ -2736,7 +2742,7 @@ mod tests {
         );
 
         // An inherited allocation task count is a direct request, so it wins
-        // over the per-node derivation.
+        // over the per-node derivation. Typed `-N` still selects node count.
         env.set("SLURM_NTASKS", "5");
         let inherited = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=8", "hostname"]);
         assert_eq!(
@@ -2784,10 +2790,16 @@ mod tests {
         client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
         cli: &[&str],
     ) -> Result<StepDispatchResult> {
-        let args = SrunArgs::try_parse_from(cli).expect("parse failed");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(cli)
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("parse failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
         let io = empty_io();
         let params = StepDispatchParams {
             args: &args,
+            explicit_num_nodes: was_cli_set(&matches, "nodes").then_some(args.nodes),
+            requested_nodelist: args.nodelist.as_deref(),
             work_dir: "/tmp",
             io: &io,
             mpi: spur_core::mpi::MPI_NONE,
@@ -2864,6 +2876,7 @@ mod tests {
             .expect("dispatch should succeed");
 
         assert_eq!(capture.create_step_num_tasks(), 3);
+        assert_eq!(capture.create_step_num_nodes(), 3);
         assert_eq!(capture.run_step_calls(), 1);
         assert_eq!(
             capture.run_step_step_id(),
@@ -2885,6 +2898,41 @@ mod tests {
             .expect("dispatch should succeed");
 
         assert_eq!(capture.create_step_num_tasks(), 2);
+        assert_eq!(capture.create_step_num_nodes(), 3);
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_forwards_nodelist() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(
+            &mut client,
+            &["srun", "-w", "node[002-003]", "-n", "2", "hostname"],
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_nodes(), 0);
+        assert_eq!(capture.create_step_nodelist(), "node[002-003]");
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_typed_nodes_keep_inherited_ntasks() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", "4");
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(&mut client, &["srun", "-N", "1", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_tasks(), 4);
+        assert_eq!(capture.create_step_num_nodes(), 1);
     }
 
     /// The per-node default feeds cpu-bind validation, so a `map_cpu` list
