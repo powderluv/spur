@@ -7,10 +7,8 @@
 //! Follows the same shape as the `MockAgent` harness in `spurctld`: bind an
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
-//! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
-//! other RPC reports `unimplemented` so an unexpected call fails loudly instead
-//! of silently returning a default.
+//! Only the RPCs exercised by CLI tests are implemented; every other RPC
+//! reports `unimplemented` so an unexpected call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -27,6 +25,14 @@ pub(crate) const MOCK_STEP_ID: u32 = 4242;
 
 /// Exit code the mock reports from `RunStep`.
 pub(crate) const MOCK_EXIT_CODE: i32 = 7;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum K8sRequest {
+    Up(proto::ClusterUpRequest),
+    Down(proto::ClusterDownRequest),
+    Status,
+    Kubeconfig(proto::ClusterKubeconfigRequest),
+}
 
 /// What the mock controller actually received, shared with the test body.
 #[derive(Clone, Default)]
@@ -46,6 +52,7 @@ pub(crate) struct StepCapture {
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
+    k8s_requests: Arc<Mutex<Vec<K8sRequest>>>,
 }
 
 impl StepCapture {
@@ -109,6 +116,10 @@ impl StepCapture {
 
     pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
         *self.update_node_fail_names.lock().unwrap() = names;
+    }
+
+    pub(crate) fn k8s_requests(&self) -> Vec<K8sRequest> {
+        self.k8s_requests.lock().unwrap().clone()
     }
 }
 
@@ -269,6 +280,65 @@ mock_controller_impl! {
                 .push((request.name, request.force));
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
         }
+
+        async fn cluster_up(
+            &self,
+            request: tonic::Request<proto::ClusterUpRequest>,
+        ) -> Result<tonic::Response<proto::ClusterUpResponse>, tonic::Status> {
+            self.capture
+                .k8s_requests
+                .lock()
+                .unwrap()
+                .push(K8sRequest::Up(request.into_inner()));
+            Ok(tonic::Response::new(proto::ClusterUpResponse {
+                accepted: true,
+                ..Default::default()
+            }))
+        }
+
+        async fn cluster_down(
+            &self,
+            request: tonic::Request<proto::ClusterDownRequest>,
+        ) -> Result<tonic::Response<proto::ClusterDownResponse>, tonic::Status> {
+            self.capture
+                .k8s_requests
+                .lock()
+                .unwrap()
+                .push(K8sRequest::Down(request.into_inner()));
+            Ok(tonic::Response::new(proto::ClusterDownResponse {
+                accepted: true,
+                ..Default::default()
+            }))
+        }
+
+        async fn cluster_status(
+            &self,
+            _request: tonic::Request<proto::ClusterStatusRequest>,
+        ) -> Result<tonic::Response<proto::ClusterStatusResponse>, tonic::Status> {
+            self.capture
+                .k8s_requests
+                .lock()
+                .unwrap()
+                .push(K8sRequest::Status);
+            Ok(tonic::Response::new(proto::ClusterStatusResponse {
+                phase: "down".into(),
+                ..Default::default()
+            }))
+        }
+
+        async fn cluster_kubeconfig(
+            &self,
+            request: tonic::Request<proto::ClusterKubeconfigRequest>,
+        ) -> Result<tonic::Response<proto::ClusterKubeconfigResponse>, tonic::Status> {
+            self.capture
+                .k8s_requests
+                .lock()
+                .unwrap()
+                .push(K8sRequest::Kubeconfig(request.into_inner()));
+            Ok(tonic::Response::new(proto::ClusterKubeconfigResponse {
+                kubeconfig: "fixture".into(),
+            }))
+        }
     }
     unimplemented {
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
@@ -305,10 +375,6 @@ mock_controller_impl! {
         delete_reservation(proto::DeleteReservationRequest) -> ();
         list_reservations(proto::ListReservationsRequest) -> proto::ListReservationsResponse;
         exec_in_job(proto::ExecInJobRequest) -> proto::ExecInJobResponse;
-        cluster_up(proto::ClusterUpRequest) -> proto::ClusterUpResponse;
-        cluster_down(proto::ClusterDownRequest) -> proto::ClusterDownResponse;
-        cluster_status(proto::ClusterStatusRequest) -> proto::ClusterStatusResponse;
-        cluster_kubeconfig(proto::ClusterKubeconfigRequest) -> proto::ClusterKubeconfigResponse;
         cluster_add_nodes(proto::ClusterAddNodesRequest) -> proto::ClusterAddNodesResponse;
         cluster_remove_nodes(proto::ClusterRemoveNodesRequest) -> proto::ClusterRemoveNodesResponse;
     }

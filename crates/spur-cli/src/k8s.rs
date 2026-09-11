@@ -119,6 +119,13 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    main_with_args_and_user_resolver(args, crate::interactive::current_user).await
+}
+
+async fn main_with_args_and_user_resolver(
+    args: Vec<String>,
+    current_user: impl Fn() -> Result<String>,
+) -> Result<()> {
     let parsed = K8sArgs::try_parse_from(args)?;
     let controller = parsed.controller;
     match parsed.command {
@@ -130,8 +137,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             partition,
             selector,
         } => {
+            let selector = selector_map(selector)?;
+            let caller = current_user()?;
             cmd_up(
                 &controller,
+                caller,
                 control_plane_node,
                 replicas,
                 control_plane_nodes,
@@ -151,9 +161,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             drain_timeout,
             force,
         } => cmd_remove_nodes(&controller, nodes, drain_timeout, force).await,
-        K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
+        K8sCommand::Down { reset } => cmd_down(&controller, current_user()?, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
-        K8sCommand::Kubeconfig { user, admin } => cmd_kubeconfig(&controller, user, admin).await,
+        K8sCommand::Kubeconfig { user, admin } => {
+            cmd_kubeconfig(&controller, current_user()?, user, admin).await
+        }
         K8sCommand::InstallK0s {
             version,
             path,
@@ -214,21 +226,21 @@ async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn cmd_up(
     controller: &str,
+    caller: String,
     control_plane_node: Option<String>,
     replicas: Option<u32>,
     control_plane_nodes: Vec<String>,
     nodes: Option<String>,
     partition: Option<String>,
-    selector: Vec<(String, String)>,
+    selector: std::collections::HashMap<String, String>,
 ) -> Result<()> {
-    let selector = selector_map(selector)?;
     let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
             control_plane_node,
             control_plane_replicas: replicas,
             control_plane_nodes,
-            caller: effective_user(),
+            caller,
             nodes: nodes.unwrap_or_default(),
             partition: partition.unwrap_or_default(),
             selector,
@@ -301,13 +313,10 @@ async fn cmd_remove_nodes(
     Ok(())
 }
 
-async fn cmd_down(controller: &str, reset: bool) -> Result<()> {
+async fn cmd_down(controller: &str, caller: String, reset: bool) -> Result<()> {
     let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
-        .cluster_down(ClusterDownRequest {
-            reset,
-            caller: effective_user(),
-        })
+        .cluster_down(ClusterDownRequest { reset, caller })
         .await?
         .into_inner();
     if resp.accepted {
@@ -352,12 +361,17 @@ async fn cmd_status(controller: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_kubeconfig(controller: &str, user: Option<String>, admin: bool) -> Result<()> {
+async fn cmd_kubeconfig(
+    controller: &str,
+    caller: String,
+    user: Option<String>,
+    admin: bool,
+) -> Result<()> {
     let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_kubeconfig(ClusterKubeconfigRequest {
             user: user.unwrap_or_default(),
-            caller: effective_user(),
+            caller,
             admin,
         })
         .await?
@@ -555,6 +569,160 @@ mod tests {
             err.kind(),
             clap::error::ErrorKind::ArgumentConflict,
             "--admin and --user must be mutually exclusive"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_commands_fail_before_dispatch_when_user_lookup_fails() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+
+        for command in [vec!["up"], vec!["down"], vec!["kubeconfig"]] {
+            let mut args = vec!["k8s".to_string(), "--controller".into(), controller.clone()];
+            args.extend(command.into_iter().map(str::to_string));
+
+            let error = main_with_args_and_user_resolver(args, || {
+                Err(anyhow::anyhow!("failed to determine current username"))
+            })
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.to_string(), "failed to determine current username");
+        }
+
+        assert!(capture.k8s_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_selectors_fail_before_user_resolution_and_dispatch() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let resolutions = std::cell::Cell::new(0);
+
+        let error = main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "--controller".into(),
+                format!("http://{addr}"),
+                "up".into(),
+                "--selector".into(),
+                "zone=z1".into(),
+                "--selector".into(),
+                "zone=z2".into(),
+            ],
+            || {
+                resolutions.set(resolutions.get() + 1);
+                Ok("fixture-user".into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "duplicate --selector key zone");
+        assert_eq!(resolutions.get(), 0);
+        assert!(capture.k8s_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_commands_send_the_resolved_caller() {
+        use crate::mock_controller::K8sRequest;
+
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+
+        main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "--controller".into(),
+                controller.clone(),
+                "up".into(),
+                "--replicas".into(),
+                "3".into(),
+            ],
+            || Ok("fixture-user".into()),
+        )
+        .await
+        .unwrap();
+        main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "--controller".into(),
+                controller.clone(),
+                "down".into(),
+                "--reset".into(),
+            ],
+            || Ok("fixture-user".into()),
+        )
+        .await
+        .unwrap();
+        main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "--controller".into(),
+                controller,
+                "kubeconfig".into(),
+                "--user".into(),
+                "target-user".into(),
+            ],
+            || Ok("fixture-user".into()),
+        )
+        .await
+        .unwrap();
+
+        let requests = capture.k8s_requests();
+        match requests.as_slice() {
+            [K8sRequest::Up(up), K8sRequest::Down(down), K8sRequest::Kubeconfig(kubeconfig)] => {
+                assert_eq!(up.caller, "fixture-user");
+                assert_eq!(up.control_plane_replicas, Some(3));
+                assert_eq!(down.caller, "fixture-user");
+                assert!(down.reset);
+                assert_eq!(kubeconfig.caller, "fixture-user");
+                assert_eq!(kubeconfig.user, "target-user");
+            }
+            requests => panic!("unexpected k8s requests: {requests:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_commands_do_not_resolve_a_caller() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+        let resolutions = std::cell::Cell::new(0);
+        let unresolved = || {
+            resolutions.set(resolutions.get() + 1);
+            Err(anyhow::anyhow!("failed to determine current username"))
+        };
+
+        main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "--controller".into(),
+                controller,
+                "status".into(),
+            ],
+            &unresolved,
+        )
+        .await
+        .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let existing_k0s = temp.path().join("k0s");
+        std::fs::write(&existing_k0s, b"fixture").unwrap();
+        main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "install-k0s".into(),
+                "--path".into(),
+                existing_k0s.to_string_lossy().into_owned(),
+            ],
+            &unresolved,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolutions.get(), 0);
+        assert_eq!(
+            capture.k8s_requests(),
+            vec![crate::mock_controller::K8sRequest::Status]
         );
     }
 }
