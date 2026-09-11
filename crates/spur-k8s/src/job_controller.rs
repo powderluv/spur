@@ -347,13 +347,30 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     if let Some(job_id) = status.spur_job_id {
         if !is_terminal(&status.state) {
             let mut ctrl = ctx.ctrl_client.lock().await;
-            let _ = ctrl
+            let result = ctrl
                 .cancel_job(CancelJobRequest {
                     job_id,
                     signal: 0,
                     user: String::new(),
                 })
                 .await;
+            drop(ctrl);
+            // Do not swallow this. A job with no Pod yet, one waiting for
+            // resources, exists ONLY in the controller queue: if the cancel is
+            // lost, the custom resource goes away and the job waits in the queue
+            // for ever with nothing left to remove it. NotFound means the
+            // controller already forgot it, which is the state we want.
+            if let Err(e) = result {
+                if e.code() != tonic::Code::NotFound {
+                    warn!(
+                        spurjob = %name, job_id, error = %e,
+                        "failed to cancel the Spur job; retrying before the SpurJob is removed"
+                    );
+                    return Err(ReconcileError::Other(format!(
+                        "cancel of Spur job {job_id} failed: {e}"
+                    )));
+                }
+            }
         }
 
         // Delete all Pods by label
