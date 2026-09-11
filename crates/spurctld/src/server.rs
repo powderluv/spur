@@ -1398,6 +1398,11 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        // Draining a node takes it out of service cluster-wide, so it needs the
+        // same bar as `update_node`, which reaches the identical state change.
+        self.require_admin(&request, "drain node")?;
+
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
         let req = request.into_inner();
         let reason = if req.reason.is_empty() {
@@ -1435,6 +1440,11 @@ impl SlurmController for ControllerService {
                 }
             }
         }
+
+        // Removing a node evicts its running jobs, so it needs the same bar as
+        // the other operator-driven node RPCs.
+        self.require_admin(&request, "remove node")?;
+
         let req = request.into_inner();
         let reason = if req.reason.is_empty() {
             None
@@ -8817,6 +8827,71 @@ mod tests {
             svc.cluster.get_node("racy-node").unwrap().labels["pool"],
             "prod",
             "only the admin's labels may land, whichever task the scheduler ran first"
+        );
+    }
+
+    /// Draining and removing a node both take it out of service and evict
+    /// running work, so neither may be reachable by a valid non-admin token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_removal_and_drain_are_admin_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut remove = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: true,
+            reason: "mallory".into(),
+        });
+        remove.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.deregister_node(remove)
+                .await
+                .expect_err("a non-admin must not remove a node")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut drain = Request::new(spur_proto::proto::DrainNodeRequest {
+            name: "n1".into(),
+            reason: "mallory".into(),
+        });
+        drain.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.drain_node(drain)
+                .await
+                .expect_err("a non-admin must not drain a node")
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+
+    /// `spurd` drains a node from its launch-failure path over an unauthenticated
+    /// channel, so the gate must keep waving through a caller with no identity —
+    /// which is also how `update_node` has always behaved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unidentified_caller_still_passes_the_node_gates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        // NotFound means the request reached the body; PermissionDenied would
+        // mean the gate turned an internal drain into a no-op.
+        let drain = Request::new(spur_proto::proto::DrainNodeRequest {
+            name: "n1".into(),
+            reason: "launch failure".into(),
+        });
+        assert_eq!(
+            svc.drain_node(drain).await.unwrap_err().code(),
+            Code::NotFound
+        );
+
+        let remove = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: false,
+            reason: String::new(),
+        });
+        assert_eq!(
+            svc.deregister_node(remove).await.unwrap_err().code(),
+            Code::NotFound
         );
     }
 

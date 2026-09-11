@@ -621,9 +621,10 @@ How client requests are authenticated.
 Privileged operations
 ~~~~~~~~~~~~~~~~~~~~~
 
-The control-plane mutations that define cluster tenancy — partitions, node
-placement and labels, ``reconfigure``, admission tokens, reservations, and the
-accounting account/user/QOS records — require a **cluster admin**. A caller with
+The control-plane mutations that define cluster tenancy — partitions, node state
+and labels (``scontrol update NodeName=``, ``spur node drain``, ``spur node
+remove``), ``reconfigure``, admission tokens, reservations, and the accounting
+account/user/QOS records — require a **cluster admin**. A caller with
 a verified non-admin identity is refused with ``PermissionDenied``. A caller with
 *no* verified identity is allowed, so that ``disabled`` and credential-less
 ``permissive`` deployments keep working; under ``mode = "required"`` every caller
@@ -860,8 +861,9 @@ matches, and the first matching entry wins.
    ``[[nodes]]`` is not a node roster. A node joins the cluster when ``spurd``
    registers with the controller, so adding a block here does not create a node,
    and removing one does not remove a node — it only clears that node's features
-   and weight. Remove a node with ``spur node remove <node>``. This differs from
-   Slurm, where ``NodeName=`` lines in ``slurm.conf`` define the roster.
+   and weight. Remove a node with ``spur node remove <node>``, which takes a
+   :ref:`cluster admin <privileged-operations>`. This differs from Slurm, where
+   ``NodeName=`` lines in ``slurm.conf`` define the roster.
 
 ``[network]``
 -------------
